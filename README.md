@@ -51,4 +51,4 @@ uv run python -m pytest tests/ -v
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+LGPL-3.0-or-later — see [LICENSE](LICENSE).
