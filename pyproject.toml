@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Persistent storage, dedup, metadata queries, and semantic search for acatome bundles"
 requires-python = ">=3.11"
 license = "LGPL-3.0-or-later"
+authors = [{name = "Reto Stamm", email = "reto@retostamm.com"}]
 readme = "README.md"
 keywords = ["scientific-papers", "storage", "semantic-search", "citations", "sqlite", "postgres"]
 classifiers = [
@@ -40,6 +41,11 @@ mysql = [
 neo4j = [
     "neo4j>=5.0",
 ]
+dev = [
+    "pytest>=8.0",
+    "black>=24.0",
+    "ruff>=0.5",
+]
 
 [project.scripts]
 acatome-store = "acatome_store.cli:app"
@@ -50,3 +56,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/acatome_store"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
