@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
@@ -37,6 +38,82 @@ from acatome_store.models import (
     seed_block_types,
 )
 from acatome_store.vector import VectorIndex, create_index
+
+log = logging.getLogger(__name__)
+
+# Block types that skip embedding (same as acatome_extract.enrich)
+_SKIP_EMBED_TYPES = {"section_header", "title", "author", "equation", "junk"}
+
+
+def _get_embedder(config: StoreConfig) -> Callable[[list[str]], list[list[float]]] | None:
+    """Build an embedding function from the store's configured profile.
+
+    Returns None if the embedding backend is unavailable.
+    """
+    if config.embed_provider == "chroma":
+        try:
+            from chromadb.utils.embedding_functions import (
+                DefaultEmbeddingFunction,
+            )
+
+            ef = DefaultEmbeddingFunction()
+
+            def _chroma_embed(texts: list[str]) -> list[list[float]]:
+                results = ef(texts)
+                return [
+                    e.tolist() if hasattr(e, "tolist") else list(e)
+                    for e in results
+                ]
+
+            return _chroma_embed
+        except Exception:
+            return None
+
+    if config.embed_provider == "sentence-transformers":
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer(config.embed_model)
+            dim = config.embed_index_dim or config.embed_dim
+
+            def _st_embed(texts: list[str]) -> list[list[float]]:
+                embs = model.encode(texts, normalize_embeddings=True)
+                return [e[:dim].tolist() for e in embs]
+
+            return _st_embed
+        except Exception:
+            return None
+
+    return None
+
+
+def _reembed_blocks(
+    blocks: list[dict[str, Any]],
+    embedder: Callable[[list[str]], list[list[float]]],
+    profile: str = "default",
+) -> list[dict[str, Any]]:
+    """Re-embed blocks using the given embedder, replacing existing embeddings."""
+    texts = []
+    indices = []
+    for i, b in enumerate(blocks):
+        if b.get("type") in _SKIP_EMBED_TYPES:
+            continue
+        text = b.get("text", "").strip()
+        if not text:
+            continue
+        texts.append(text)
+        indices.append(i)
+
+    if not texts:
+        return blocks
+
+    embeddings = embedder(texts)
+    for idx, emb in zip(indices, embeddings):
+        if "embeddings" not in blocks[idx]:
+            blocks[idx]["embeddings"] = {}
+        blocks[idx]["embeddings"][profile] = emb
+
+    return blocks
 
 
 class Store:
@@ -319,8 +396,40 @@ class Store:
             session.commit()
             ref_id = ref.id
 
-        # Index embeddings in vector store (best-effort)
+        # Check embedding model compatibility and re-embed if needed
         if blocks:
+            bundle_models = enrich_meta.get("embedding_models", {})
+            bundle_default = bundle_models.get("default", {})
+            bundle_model = bundle_default.get("model", "")
+
+            needs_reembed = (
+                not bundle_model  # no enrichment metadata → embed from scratch
+                or bundle_model != self._config.embed_model
+            )
+
+            if needs_reembed:
+                log.warning(
+                    "Embedding model mismatch: bundle has '%s', system expects '%s' "
+                    "— re-embedding %d blocks",
+                    bundle_model,
+                    self._config.embed_model,
+                    len(blocks),
+                )
+                embedder = _get_embedder(self._config)
+                if embedder:
+                    try:
+                        blocks = _reembed_blocks(blocks, embedder)
+                    except Exception:
+                        log.warning("Re-embedding failed, skipping vector index")
+                        blocks = []  # skip indexing
+                else:
+                    log.warning(
+                        "No embedder available for '%s', skipping vector index",
+                        self._config.embed_provider,
+                    )
+                    blocks = []  # skip indexing
+
+            # Index embeddings in vector store (best-effort)
             try:
                 self.index.add_blocks(str(ref_id), blocks)
             except Exception:
@@ -463,15 +572,17 @@ class Store:
                 preview = r.summary or (
                     r.text[:120] + "…" if len(r.text) > 120 else r.text
                 )
-                toc.append(
-                    {
-                        "node_id": r.node_id,
-                        "page": r.page,
-                        "block_type": r.block_type,
-                        "section_path": r.section_path,
-                        "preview": preview,
-                    }
-                )
+                entry = {
+                    "node_id": r.node_id,
+                    "block_index": r.block_index,
+                    "page": r.page,
+                    "block_type": r.block_type,
+                    "section_path": r.section_path,
+                    "preview": preview,
+                }
+                if r.summary:
+                    entry["has_summary"] = True
+                toc.append(entry)
             return toc
 
     def delete(self, identifier) -> bool:

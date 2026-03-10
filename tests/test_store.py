@@ -61,6 +61,150 @@ class TestIngest:
             store.ingest(collision_path)
 
 
+class TestReembed:
+    """Test embedding model mismatch detection and re-embed on ingest."""
+
+    def test_matching_model_no_reembed(self, store, tmp_path):
+        """When bundle model matches system config, embeddings pass through."""
+        import gzip, json
+        from unittest.mock import patch
+
+        data = {
+            "header": {
+                "paper_id": "doi:10.1234/match",
+                "slug": "match2024",
+                "title": "Match",
+                "authors": [],
+                "year": 2024,
+                "doi": "10.1234/match",
+                "pdf_hash": "e" * 64,
+                "page_count": 1,
+                "source": "test",
+                "verified": True,
+                "verify_warnings": [],
+                "extracted_at": "2024-01-01T00:00:00+00:00",
+            },
+            "blocks": [
+                {
+                    "node_id": "match-p00-000",
+                    "page": 0,
+                    "type": "text",
+                    "text": "Some text about matching embeddings.",
+                    "section_path": [],
+                    "bbox": None,
+                    "embeddings": {"default": [0.1] * 384},
+                    "summary": None,
+                }
+            ],
+            "enrichment_meta": {
+                "embedding_models": {
+                    "default": {"model": store._config.embed_model, "dim": 384}
+                }
+            },
+        }
+        path = tmp_path / "match.acatome"
+        with gzip.open(path, "wt") as f:
+            json.dump(data, f)
+
+        from acatome_store import store as store_mod
+
+        with patch.object(store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks) as mock_reembed:
+            store.ingest(path)
+            mock_reembed.assert_not_called()
+
+    def test_mismatched_model_triggers_reembed(self, store, tmp_path):
+        """When bundle model differs from system config, blocks are re-embedded."""
+        import gzip, json
+        from unittest.mock import patch
+
+        data = {
+            "header": {
+                "paper_id": "doi:10.1234/mismatch",
+                "slug": "mismatch2024",
+                "title": "Mismatch",
+                "authors": [],
+                "year": 2024,
+                "doi": "10.1234/mismatch",
+                "pdf_hash": "f" * 64,
+                "page_count": 1,
+                "source": "test",
+                "verified": True,
+                "verify_warnings": [],
+                "extracted_at": "2024-01-01T00:00:00+00:00",
+            },
+            "blocks": [
+                {
+                    "node_id": "mismatch-p00-000",
+                    "page": 0,
+                    "type": "text",
+                    "text": "Some text about mismatched embeddings.",
+                    "section_path": [],
+                    "bbox": None,
+                    "embeddings": {"default": [0.1] * 768},
+                    "summary": None,
+                }
+            ],
+            "enrichment_meta": {
+                "embedding_models": {
+                    "default": {"model": "some-other-model", "dim": 768}
+                }
+            },
+        }
+        path = tmp_path / "mismatch.acatome"
+        with gzip.open(path, "wt") as f:
+            json.dump(data, f)
+
+        from acatome_store import store as store_mod
+
+        with patch.object(store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks) as mock_reembed:
+            store.ingest(path)
+            mock_reembed.assert_called_once()
+
+    def test_no_enrichment_meta_triggers_reembed(self, store, tmp_path):
+        """When bundle has no enrichment_meta, blocks are re-embedded."""
+        import gzip, json
+        from unittest.mock import patch
+
+        data = {
+            "header": {
+                "paper_id": "doi:10.1234/noenrich",
+                "slug": "noenrich2024",
+                "title": "No Enrich",
+                "authors": [],
+                "year": 2024,
+                "doi": "10.1234/noenrich",
+                "pdf_hash": "1a" * 32,
+                "page_count": 1,
+                "source": "test",
+                "verified": True,
+                "verify_warnings": [],
+                "extracted_at": "2024-01-01T00:00:00+00:00",
+            },
+            "blocks": [
+                {
+                    "node_id": "noenrich-p00-000",
+                    "page": 0,
+                    "type": "text",
+                    "text": "Some text without any embeddings at all.",
+                    "section_path": [],
+                    "bbox": None,
+                    "embeddings": {},
+                    "summary": None,
+                }
+            ],
+            "enrichment_meta": None,
+        }
+        path = tmp_path / "noenrich.acatome"
+        with gzip.open(path, "wt") as f:
+            json.dump(data, f)
+
+        from acatome_store import store as store_mod
+
+        with patch.object(store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks) as mock_reembed:
+            store.ingest(path)
+            mock_reembed.assert_called_once()
+
+
 class TestGet:
     def test_get_by_ref_id(self, store, sample_bundle):
         ref_id = store.ingest(sample_bundle)

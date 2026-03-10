@@ -99,6 +99,7 @@ class ChromaIndex(VectorIndex):
                     metadata={
                         "paper_id": paper_id,
                         "node_id": node_id,
+                        "block_index": block.get("block_index") or 0,
                         "page": block.get("page", 0),
                         "type": block.get("type", "text"),
                         "profile": profile,
@@ -262,6 +263,7 @@ class PgVectorIndex(VectorIndex):
                     "metadata": {
                         "paper_id": row.Block.paper_id,
                         "node_id": row.Block.node_id,
+                        "block_index": row.Block.block_index or 0,
                         "page": row.Block.page,
                         "type": row.Block.block_type,
                         "profile": row.Block.profile,
@@ -324,6 +326,7 @@ class PgVectorIndex(VectorIndex):
                     "metadata": {
                         "paper_id": str(row.Block.ref_id),
                         "node_id": row.Block.node_id,
+                        "block_index": row.Block.block_index or 0,
                         "page": row.Block.page,
                         "block_type": row.Block.block_type,
                         "type": row.Block.block_type,

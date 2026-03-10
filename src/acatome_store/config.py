@@ -30,6 +30,12 @@ class StoreConfig:
     pg_user: str = "acatome"
     pg_password: str = ""
 
+    # Embedding profile ("default" profile from extract config)
+    embed_model: str = "all-MiniLM-L6-v2"
+    embed_dim: int = 384
+    embed_provider: str = "chroma"
+    embed_index_dim: int | None = None
+
     @property
     def db_url(self) -> str:
         """SQLAlchemy connection string.
@@ -57,6 +63,7 @@ class StoreConfig:
         from acatome_meta.config import load_config
 
         cfg = load_config()
+        profile = cfg.extract.profiles.get("default")
         return cls(
             store_path=cfg.store_path,
             vector_backend=cfg.store.vector_backend,
@@ -68,4 +75,8 @@ class StoreConfig:
             pg_schema=cfg.store.pg_schema,
             pg_user=cfg.store.pg_user,
             pg_password=cfg.store.pg_password,
+            embed_model=profile.model if profile else "all-MiniLM-L6-v2",
+            embed_dim=profile.dim if profile else 384,
+            embed_provider=profile.provider if profile else "chroma",
+            embed_index_dim=profile.index_dim if profile else None,
         )

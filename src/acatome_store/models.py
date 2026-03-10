@@ -57,6 +57,7 @@ BLOCK_TYPE_SEEDS = [
     ("abstract", "original", "Paper abstract"),
     ("paper_summary", "generated", "LLM-generated paper summary"),
     ("block_summary", "generated", "LLM-generated block summary"),
+    ("junk", "original", "Frontmatter boilerplate (copyright, reviewer info, etc.)"),
 ]
 
 
