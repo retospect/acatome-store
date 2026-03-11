@@ -19,15 +19,23 @@ def ingest(
     store = Store()
     if path.is_file():
         paper_id = store.ingest(path)
-        typer.echo(f"✓ {paper_id}")
+        typer.echo(f"✓ {path.name} → ref {paper_id}")
     elif path.is_dir():
-        bundles = sorted(path.glob("*.acatome"))
-        for b in bundles:
+        bundles = sorted(path.rglob("*.acatome"))
+        if not bundles:
+            typer.echo(f"No .acatome bundles found in {path}")
+            raise typer.Exit(1)
+        typer.echo(f"Found {len(bundles)} bundles in {path}")
+        succeeded, failed = 0, 0
+        for i, b in enumerate(bundles, 1):
             try:
                 paper_id = store.ingest(b)
-                typer.echo(f"✓ {paper_id}")
+                succeeded += 1
+                typer.echo(f"  [{i}/{len(bundles)}] ✓ {b.name} → ref {paper_id}")
             except Exception as e:
-                typer.echo(f"✗ {b.name}: {e}", err=True)
+                failed += 1
+                typer.echo(f"  [{i}/{len(bundles)}] ✗ {b.name}: {e}")
+        typer.echo(f"\nDone: {succeeded} ingested, {failed} failed")
     else:
         typer.echo(f"Error: {path} not found", err=True)
         raise typer.Exit(1)
