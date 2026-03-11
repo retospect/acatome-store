@@ -5,4 +5,4 @@ from acatome_store.store import Store
 from acatome_store.vector import VectorIndex, ChromaIndex, create_index
 
 __all__ = ["Store", "Ref", "VectorIndex", "ChromaIndex", "create_index"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
