@@ -27,6 +27,8 @@ from typing import Any, Callable
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
+from precis_summary import pick_best_summary
+
 from acatome_store.config import StoreConfig
 from acatome_store.models import (
     Base,
@@ -352,7 +354,12 @@ class Store:
 
             # Insert paper summary as a block (if present)
             enrich_meta = data.get("enrichment_meta") or {}
-            paper_summary = enrich_meta.get("paper_summary", "")
+            # New format: paper_summaries dict; old format: paper_summary string
+            paper_summaries = enrich_meta.get("paper_summaries") or {}
+            paper_summary = (
+                pick_best_summary(paper_summaries)
+                or enrich_meta.get("paper_summary", "")
+            )
             if paper_summary:
                 session.add(
                     Block(
@@ -384,7 +391,7 @@ class Store:
                     block_index=block_index,
                     block_type=b.get("type", "text"),
                     text=b.get("text", ""),
-                    summary=b.get("summary"),
+                    summary=pick_best_summary(b.get("summaries")) or b.get("summary"),
                     section_path=json.dumps(b.get("section_path", [])),
                     bbox_x0=bbox[0] if bbox else None,
                     bbox_y0=bbox[1] if bbox else None,
@@ -798,7 +805,7 @@ class Store:
                     block_index=block_index,
                     block_type=b.get("type", "text"),
                     text=b.get("text", ""),
-                    summary=b.get("summary"),
+                    summary=pick_best_summary(b.get("summaries")) or b.get("summary"),
                     supplement=supplement_name,
                     section_path=json.dumps(b.get("section_path", [])),
                     bbox_x0=bbox[0] if bbox else None,
