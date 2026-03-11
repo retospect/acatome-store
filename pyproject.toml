@@ -3,14 +3,14 @@ name = "acatome-store"
 version = "0.2.1"
 description = "Persistent storage, dedup, metadata queries, and semantic search for acatome bundles"
 requires-python = ">=3.11"
-license = "LGPL-3.0-or-later"
+license = "GPL-3.0-or-later"
 authors = [{name = "Reto Stamm", email = "reto@retostamm.com"}]
 readme = "README.md"
 keywords = ["scientific-papers", "storage", "semantic-search", "citations", "sqlite", "postgres"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
