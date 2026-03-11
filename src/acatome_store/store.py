@@ -28,6 +28,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from precis_summary import pick_best_summary
+from precis_summary.rake import telegram_precis
 
 from acatome_store.config import StoreConfig
 from acatome_store.models import (
@@ -400,6 +401,19 @@ class Store:
                 )
                 session.add(block)
 
+            # Aggregate block-level RAKE keywords into paper-level keywords
+            if not ref.keywords:
+                rake_parts = []
+                for b in blocks:
+                    summaries = b.get("summaries") or {}
+                    rake = summaries.get("rake", "")
+                    if rake:
+                        rake_parts.append(rake)
+                if rake_parts:
+                    combined = "; ".join(rake_parts)
+                    paper_kw = telegram_precis(combined, min_n=3, max_n=8)
+                    ref.keywords = json.dumps(paper_kw.split("; "))
+
             session.commit()
             ref_id = ref.id
 
@@ -630,16 +644,31 @@ class Store:
                 .scalars()
                 .all()
             )
-            return [
-                {
-                    "ref_id": r.id,
-                    "slug": r.paper.slug if r.paper else None,
-                    "title": r.title,
-                    "year": r.year,
-                    "doi": r.doi,
-                }
-                for r in rows
-            ]
+            result = []
+            for r in rows:
+                block_count = (
+                    session.query(Block)
+                    .filter(Block.ref_id == r.id, Block.profile == "default")
+                    .count()
+                )
+                kw = None
+                if r.keywords:
+                    try:
+                        kw = json.loads(r.keywords)
+                    except (json.JSONDecodeError, TypeError):
+                        kw = r.keywords
+                result.append(
+                    {
+                        "ref_id": r.id,
+                        "slug": r.paper.slug if r.paper else None,
+                        "title": r.title,
+                        "year": r.year,
+                        "doi": r.doi,
+                        "block_count": block_count,
+                        "keywords": kw,
+                    }
+                )
+            return result
 
     def stats(self) -> dict[str, Any]:
         """Return store statistics."""

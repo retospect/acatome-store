@@ -1,6 +1,6 @@
 [project]
 name = "acatome-store"
-version = "0.2.1"
+version = "0.2.2"
 description = "Persistent storage, dedup, metadata queries, and semantic search for acatome bundles"
 requires-python = ">=3.11"
 license = "GPL-3.0-or-later"
@@ -71,7 +71,7 @@ line-length = 88
 line-length = 88
 
 [tool.bumpversion]
-current_version = "0.2.1"
+current_version = "0.2.2"
 commit = true
 tag = true
 tag_name = "v{new_version}"
