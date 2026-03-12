@@ -48,7 +48,9 @@ log = logging.getLogger(__name__)
 _SKIP_EMBED_TYPES = {"section_header", "title", "author", "equation", "junk"}
 
 
-def _get_embedder(config: StoreConfig) -> Callable[[list[str]], list[list[float]]] | None:
+def _get_embedder(
+    config: StoreConfig,
+) -> Callable[[list[str]], list[list[float]]] | None:
     """Build an embedding function from the store's configured profile.
 
     Returns None if the embedding backend is unavailable.
@@ -64,8 +66,7 @@ def _get_embedder(config: StoreConfig) -> Callable[[list[str]], list[list[float]
             def _chroma_embed(texts: list[str]) -> list[list[float]]:
                 results = ef(texts)
                 return [
-                    e.tolist() if hasattr(e, "tolist") else list(e)
-                    for e in results
+                    e.tolist() if hasattr(e, "tolist") else list(e) for e in results
                 ]
 
             return _chroma_embed
@@ -357,9 +358,8 @@ class Store:
             enrich_meta = data.get("enrichment_meta") or {}
             # New format: paper_summaries dict; old format: paper_summary string
             paper_summaries = enrich_meta.get("paper_summaries") or {}
-            paper_summary = (
-                pick_best_summary(paper_summaries)
-                or enrich_meta.get("paper_summary", "")
+            paper_summary = pick_best_summary(paper_summaries) or enrich_meta.get(
+                "paper_summary", ""
             )
             if paper_summary:
                 session.add(
@@ -671,23 +671,46 @@ class Store:
             return result
 
     def stats(self) -> dict[str, Any]:
-        """Return store statistics."""
+        """Return store statistics and connection info."""
+        cfg = self._config
         with self._Session() as session:
             total_refs = session.query(Ref).count()
             total_ingested = session.query(Paper).count()
+            total_blocks = session.query(Block).count()
             verified = session.query(Paper).filter(Paper.verified.is_(True)).count()
         indexed = 0
         try:
             indexed = self.index.count()
         except Exception:
             pass
-        return {
-            "total_refs": total_refs,
-            "total_papers": total_ingested,
-            "verified": verified,
-            "indexed_blocks": indexed,
-            "store_path": str(self._config.store_path),
+
+        # Connection info
+        info: dict[str, Any] = {
+            "metadata_backend": cfg.metadata_backend,
         }
+        if cfg.metadata_backend == "postgres":
+            info["pg_host"] = cfg.pg_host
+            info["pg_port"] = cfg.pg_port
+            info["pg_database"] = cfg.pg_database
+            info["pg_schema"] = cfg.pg_schema
+            info["pg_user"] = cfg.pg_user
+        else:
+            info["db_path"] = str(cfg.store_path / "acatome.db")
+
+        info.update(
+            {
+                "vector_backend": cfg.vector_backend,
+                "embed_model": cfg.embed_model,
+                "embed_dim": cfg.embed_dim,
+                "store_path": str(cfg.store_path),
+                "total_refs": total_refs,
+                "total_papers": total_ingested,
+                "total_blocks": total_blocks,
+                "verified": verified,
+                "indexed_blocks": indexed,
+            }
+        )
+        return info
 
     # ------------------------------------------------------------------
     # Notes

@@ -108,7 +108,9 @@ class TestReembed:
 
         from acatome_store import store as store_mod
 
-        with patch.object(store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks) as mock_reembed:
+        with patch.object(
+            store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks
+        ) as mock_reembed:
             store.ingest(path)
             mock_reembed.assert_not_called()
 
@@ -156,7 +158,9 @@ class TestReembed:
 
         from acatome_store import store as store_mod
 
-        with patch.object(store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks) as mock_reembed:
+        with patch.object(
+            store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks
+        ) as mock_reembed:
             store.ingest(path)
             mock_reembed.assert_called_once()
 
@@ -200,7 +204,9 @@ class TestReembed:
 
         from acatome_store import store as store_mod
 
-        with patch.object(store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks) as mock_reembed:
+        with patch.object(
+            store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks
+        ) as mock_reembed:
             store.ingest(path)
             mock_reembed.assert_called_once()
 
