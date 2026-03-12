@@ -32,7 +32,8 @@ from acatome_store import Store
 store = Store()
 ref_id = store.ingest(bundle_path)
 paper = store.get(ref_id)
-results = store.search("transformer attention", top_k=5)
+results = store.search_text("transformer attention", top_k=5)
+# hits include paper info, block summaries, and text
 ```
 
 ## CLI

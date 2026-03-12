@@ -486,7 +486,45 @@ class Store:
                         "year": paper.get("year"),
                         "doi": paper.get("doi"),
                     }
+
+        # Batch-fetch block summaries
+        lookups = []
+        for hit in hits:
+            meta = hit.get("metadata", {})
+            pid = meta.get("paper_id")
+            bi = meta.get("block_index")
+            if pid is not None and bi is not None:
+                lookups.append((int(pid), int(bi)))
+        if lookups:
+            summaries = self._batch_block_summaries(lookups)
+            for hit in hits:
+                meta = hit.get("metadata", {})
+                pid = meta.get("paper_id")
+                bi = meta.get("block_index")
+                if pid is not None and bi is not None:
+                    s = summaries.get((int(pid), int(bi)))
+                    if s:
+                        hit["summary"] = s
+
         return hits
+
+    def _batch_block_summaries(
+        self, keys: list[tuple[int, int]]
+    ) -> dict[tuple[int, int], str]:
+        """Fetch block summaries for a list of (ref_id, block_index) pairs."""
+        from sqlalchemy import tuple_
+
+        with self._Session() as session:
+            stmt = (
+                select(Block.ref_id, Block.block_index, Block.summary)
+                .where(
+                    tuple_(Block.ref_id, Block.block_index).in_(keys),
+                    Block.summary.isnot(None),
+                    Block.profile == "default",
+                )
+            )
+            rows = session.execute(stmt).all()
+            return {(r[0], r[1]): r[2] for r in rows if r[2]}
 
     # ------------------------------------------------------------------
     # CRUD
