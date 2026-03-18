@@ -374,14 +374,10 @@ class Store:
                     )
                 )
 
-            # Insert blocks
+            # Insert blocks (block_index is a global sequential counter)
             blocks = data.get("blocks", [])
-            for b in blocks:
+            for block_index, b in enumerate(blocks):
                 node_id = b["node_id"]
-                try:
-                    block_index = int(node_id.rsplit("-", 1)[-1])
-                except (ValueError, IndexError):
-                    block_index = 0
 
                 bbox = b.get("bbox")
                 block = Block(
@@ -644,6 +640,41 @@ class Store:
                 toc.append(entry)
             return toc
 
+    def reindex_blocks(self, identifier=None) -> int:
+        """Reassign block_index as a global sequential counter per paper.
+
+        Fixes papers ingested with the old per-page block_index scheme.
+        If *identifier* is given, reindex that paper only; otherwise all.
+        Returns the number of papers reindexed.
+        """
+        papers = (
+            [self.get(identifier)] if identifier else self.list_papers(limit=10_000)
+        )
+        count = 0
+        with self._Session() as session:
+            for paper in papers:
+                if not paper or "ref_id" not in paper:
+                    continue
+                ref_id = paper["ref_id"]
+                rows = (
+                    session.execute(
+                        select(Block)
+                        .where(
+                            Block.ref_id == ref_id,
+                            Block.supplement.is_(None),
+                        )
+                        .order_by(Block.page, Block.block_index, Block.node_id)
+                    )
+                    .scalars()
+                    .all()
+                )
+                for new_idx, row in enumerate(rows):
+                    if row.block_index != new_idx:
+                        row.block_index = new_idx
+                count += 1
+            session.commit()
+        return count
+
     def delete(self, identifier) -> bool:
         """Delete the ingested Paper + blocks (keeps the Ref stub)."""
         paper_dict = self.get(identifier)
@@ -877,14 +908,10 @@ class Store:
                 session.delete(b)
             session.flush()
 
-            # Insert supplement blocks
+            # Insert supplement blocks (block_index is a global sequential counter)
             blocks = data.get("blocks", [])
-            for b in blocks:
+            for block_index, b in enumerate(blocks):
                 node_id = b["node_id"]
-                try:
-                    block_index = int(node_id.rsplit("-", 1)[-1])
-                except (ValueError, IndexError):
-                    block_index = 0
 
                 bbox = b.get("bbox")
                 block = Block(

@@ -82,7 +82,7 @@ class ChromaIndex(VectorIndex):
         from llama_index.core.schema import TextNode
 
         nodes: list[TextNode] = []
-        for block in blocks:
+        for global_idx, block in enumerate(blocks):
             emb_dict = block.get("embeddings", {})
             if profile not in emb_dict:
                 continue
@@ -99,7 +99,7 @@ class ChromaIndex(VectorIndex):
                     metadata={
                         "paper_id": paper_id,
                         "node_id": node_id,
-                        "block_index": block.get("block_index") or 0,
+                        "block_index": global_idx,
                         "page": block.get("page", 0),
                         "type": block.get("type", "text"),
                         "profile": profile,
