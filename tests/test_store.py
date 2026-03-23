@@ -376,6 +376,52 @@ class TestNotes:
         assert store.get_notes(block_node_id=node_id) == []
 
 
+class TestTags:
+    def test_ingest_with_tags(self, store, sample_bundle):
+        ref_id = store.ingest(sample_bundle, tags=["chlorine-evolution", "review"])
+        tags = store.get_tags(ref_id)
+        assert tags == ["chlorine-evolution", "review"]
+
+    def test_ingest_dedup_merges_tags(self, store, sample_bundle):
+        store.ingest(sample_bundle, tags=["batch-1"])
+        store.ingest(sample_bundle, tags=["batch-2"])
+        tags = store.get_tags("smith2024quantum")
+        assert "batch-1" in tags
+        assert "batch-2" in tags
+
+    def test_add_tags(self, store, sample_bundle):
+        ref_id = store.ingest(sample_bundle)
+        assert store.get_tags(ref_id) == []
+        store.add_tags(ref_id, ["new-tag"])
+        assert store.get_tags(ref_id) == ["new-tag"]
+
+    def test_remove_tags(self, store, sample_bundle):
+        store.ingest(sample_bundle, tags=["a", "b", "c"])
+        store.remove_tags("smith2024quantum", ["b"])
+        assert store.get_tags("smith2024quantum") == ["a", "c"]
+
+    def test_find_by_tag(self, store, sample_bundle, second_bundle):
+        store.ingest(sample_bundle, tags=["shared"])
+        store.ingest(second_bundle, tags=["shared", "extra"])
+        results = store.find_by_tag("shared")
+        assert len(results) == 2
+        results = store.find_by_tag("extra")
+        assert len(results) == 1
+
+    def test_list_tags(self, store, sample_bundle, second_bundle):
+        store.ingest(sample_bundle, tags=["a", "b"])
+        store.ingest(second_bundle, tags=["b", "c"])
+        tag_counts = store.list_tags()
+        assert tag_counts["b"] == 2
+        assert tag_counts["a"] == 1
+        assert tag_counts["c"] == 1
+
+    def test_tags_not_found(self, store):
+        assert store.get_tags("nonexistent") == []
+        assert not store.add_tags("nonexistent", ["x"])
+        assert not store.remove_tags("nonexistent", ["x"])
+
+
 class TestSupplements:
     def test_ingest_supplement(self, store, sample_bundle, supplement_bundle):
         ref_id = store.ingest(sample_bundle)

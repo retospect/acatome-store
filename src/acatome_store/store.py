@@ -271,11 +271,20 @@ class Store:
         session.flush()  # ensure ref.id is assigned
         return ref
 
+    @staticmethod
+    def _merge_tags(ref: Ref, new_tags: list[str]) -> None:
+        """Additively merge tags into a Ref (deduped, sorted)."""
+        existing: list[str] = json.loads(ref.tags) if ref.tags else []
+        merged = sorted(set(existing) | set(new_tags))
+        ref.tags = json.dumps(merged)
+
     # ------------------------------------------------------------------
     # Ingest
     # ------------------------------------------------------------------
 
-    def ingest(self, bundle_path: str | Path) -> int:
+    def ingest(
+        self, bundle_path: str | Path, *, tags: list[str] | None = None
+    ) -> int:
         """Ingest a .acatome bundle into the store.
 
         Dedup rules:
@@ -283,6 +292,8 @@ class Store:
         - Same DOI, different PDF → skip (return existing ref_id)
         - Same slug, different ref → raise ValueError
         - Same ref, re-ingest → atomic replace of Paper + blocks
+
+        Tags are always merged additively, even on dedup skip.
 
         Returns:
             ref_id (int) of the ingested paper.
@@ -299,6 +310,11 @@ class Store:
                 select(Paper).where(Paper.pdf_hash == pdf_hash)
             ).scalar_one_or_none()
             if existing:
+                if tags:
+                    ref = session.get(Ref, existing.ref_id)
+                    if ref:
+                        self._merge_tags(ref, tags)
+                        session.commit()
                 return existing.ref_id
 
             # Find or create the Ref (identity)
@@ -409,6 +425,9 @@ class Store:
                     combined = "; ".join(rake_parts)
                     paper_kw = telegram_precis(combined, min_n=3, max_n=8)
                     ref.keywords = json.dumps(paper_kw.split("; "))
+
+            if tags:
+                self._merge_tags(ref, tags)
 
             session.commit()
             ref_id = ref.id
@@ -962,6 +981,98 @@ class Store:
             return json.loads(supps)
         except (json.JSONDecodeError, TypeError):
             return []
+
+    # ------------------------------------------------------------------
+    # Tags
+    # ------------------------------------------------------------------
+
+    def add_tags(self, identifier, tags: list[str]) -> bool:
+        """Add tags to a paper (additive, deduped).
+
+        Args:
+            identifier: ref_id (int), slug, or DOI.
+            tags: Tag strings to add.
+
+        Returns:
+            True if the ref was found and updated.
+        """
+        paper_dict = self.get(identifier)
+        if not paper_dict or "id" not in paper_dict:
+            return False
+        with self._Session() as session:
+            ref = session.get(Ref, paper_dict["id"])
+            if not ref:
+                return False
+            self._merge_tags(ref, tags)
+            session.commit()
+        return True
+
+    def remove_tags(self, identifier, tags: list[str]) -> bool:
+        """Remove tags from a paper.
+
+        Args:
+            identifier: ref_id (int), slug, or DOI.
+            tags: Tag strings to remove.
+
+        Returns:
+            True if the ref was found and updated.
+        """
+        paper_dict = self.get(identifier)
+        if not paper_dict or "id" not in paper_dict:
+            return False
+        with self._Session() as session:
+            ref = session.get(Ref, paper_dict["id"])
+            if not ref:
+                return False
+            existing: list[str] = json.loads(ref.tags) if ref.tags else []
+            remaining = sorted(set(existing) - set(tags))
+            ref.tags = json.dumps(remaining) if remaining else None
+            session.commit()
+        return True
+
+    def get_tags(self, identifier) -> list[str]:
+        """Return tags for a paper, or empty list."""
+        paper_dict = self.get(identifier)
+        if not paper_dict:
+            return []
+        raw = paper_dict.get("tags")
+        if not raw:
+            return []
+        try:
+            return json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    def find_by_tag(self, tag: str) -> list[dict[str, Any]]:
+        """Find all papers with a given tag.
+
+        Returns list of dicts with ref_id, slug, title, year, tags.
+        """
+        with self._Session() as session:
+            refs = session.execute(select(Ref)).scalars().all()
+            results = []
+            for r in refs:
+                tags: list[str] = json.loads(r.tags) if r.tags else []
+                if tag in tags:
+                    results.append({
+                        "ref_id": r.id,
+                        "slug": r.paper.slug if r.paper else None,
+                        "title": r.title,
+                        "year": r.year,
+                        "tags": tags,
+                    })
+            return results
+
+    def list_tags(self) -> dict[str, int]:
+        """Return all tags with counts, sorted by count descending."""
+        with self._Session() as session:
+            refs = session.execute(select(Ref)).scalars().all()
+            counts: dict[str, int] = {}
+            for r in refs:
+                tags: list[str] = json.loads(r.tags) if r.tags else []
+                for t in tags:
+                    counts[t] = counts.get(t, 0) + 1
+            return dict(sorted(counts.items(), key=lambda x: -x[1]))
 
     # ------------------------------------------------------------------
     # Retractions

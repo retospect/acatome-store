@@ -98,6 +98,7 @@ class Ref(Base):
     entry_type: Mapped[str] = mapped_column(String, default="article")
     keywords: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
     source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
     retracted: Mapped[bool] = mapped_column(Boolean, default=False)
     retraction_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(
