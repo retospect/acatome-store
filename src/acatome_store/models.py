@@ -253,6 +253,7 @@ class Note(Base):
     block_profile: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    origin: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # e.g. "reto", "claude", "bot"
     tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

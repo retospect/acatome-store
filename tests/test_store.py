@@ -376,6 +376,25 @@ class TestNotes:
         assert store.get_notes(block_node_id=node_id) == []
 
 
+    def test_add_note_with_origin(self, store, sample_bundle):
+        ref_id = store.ingest(sample_bundle)
+        note_id = store.add_note("Human note", ref_id=ref_id, origin="reto")
+        notes = store.get_notes(ref_id=ref_id)
+        assert notes[0]["origin"] == "reto"
+
+    def test_add_note_bot_origin(self, store, sample_bundle):
+        ref_id = store.ingest(sample_bundle)
+        store.add_note("Bot note", ref_id=ref_id, origin="bot")
+        notes = store.get_notes(ref_id=ref_id)
+        assert notes[0]["origin"] == "bot"
+
+    def test_add_note_no_origin(self, store, sample_bundle):
+        ref_id = store.ingest(sample_bundle)
+        store.add_note("No origin", ref_id=ref_id)
+        notes = store.get_notes(ref_id=ref_id)
+        assert notes[0]["origin"] is None
+
+
 class TestTags:
     def test_ingest_with_tags(self, store, sample_bundle):
         ref_id = store.ingest(sample_bundle, tags=["chlorine-evolution", "review"])

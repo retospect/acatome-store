@@ -168,7 +168,7 @@ class Store:
         # Auto-migrate: add missing columns if Postgres
         if is_pg:
             self._ensure_embedding_column()
-            self._ensure_tags_column()
+            self._ensure_missing_columns()
 
         # Seed block_types lookup and create convenience view
         with self._Session() as session:
@@ -178,22 +178,27 @@ class Store:
         except Exception:
             pass  # SQLite doesn't support CREATE OR REPLACE VIEW in all versions
 
-    def _ensure_tags_column(self) -> None:
-        """Add tags column to refs table if missing (Postgres only)."""
+    def _ensure_missing_columns(self) -> None:
+        """Add missing columns to existing tables (Postgres only)."""
+        migrations = [
+            ("refs", "tags", "TEXT"),
+            ("notes", "origin", "VARCHAR"),
+        ]
         try:
             from sqlalchemy import text
 
             with self._engine.connect() as conn:
-                row = conn.execute(
-                    text(
-                        "SELECT 1 FROM information_schema.columns "
-                        "WHERE table_name='refs' AND column_name='tags'"
-                    )
-                ).fetchone()
-                if not row:
-                    conn.execute(
-                        text("ALTER TABLE refs ADD COLUMN tags TEXT")
-                    )
+                for table, column, col_type in migrations:
+                    row = conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.columns "
+                            f"WHERE table_name='{table}' AND column_name='{column}'"
+                        )
+                    ).fetchone()
+                    if not row:
+                        conn.execute(
+                            text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                        )
                 conn.commit()
         except Exception:
             pass  # non-fatal
@@ -834,6 +839,7 @@ class Store:
         block_profile: str = "default",
         title: str | None = None,
         tags: list[str] | None = None,
+        origin: str | None = None,
     ) -> int:
         """Add a note on a paper (ref_id) or block (block_node_id).
 
@@ -847,6 +853,7 @@ class Store:
                 title=title,
                 content=content,
                 tags=json.dumps(tags) if tags else None,
+                origin=origin,
             )
             session.add(note)
             session.commit()
