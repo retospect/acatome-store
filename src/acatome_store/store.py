@@ -165,9 +165,10 @@ class Store:
         Base.metadata.create_all(self._engine)
         self._Session = sessionmaker(bind=self._engine)
 
-        # Auto-migrate: add embedding column if Postgres and missing
+        # Auto-migrate: add missing columns if Postgres
         if is_pg:
             self._ensure_embedding_column()
+            self._ensure_tags_column()
 
         # Seed block_types lookup and create convenience view
         with self._Session() as session:
@@ -176,6 +177,26 @@ class Store:
             create_blocks_view(self._engine)
         except Exception:
             pass  # SQLite doesn't support CREATE OR REPLACE VIEW in all versions
+
+    def _ensure_tags_column(self) -> None:
+        """Add tags column to refs table if missing (Postgres only)."""
+        try:
+            from sqlalchemy import text
+
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name='refs' AND column_name='tags'"
+                    )
+                ).fetchone()
+                if not row:
+                    conn.execute(
+                        text("ALTER TABLE refs ADD COLUMN tags TEXT")
+                    )
+                conn.commit()
+        except Exception:
+            pass  # non-fatal
 
     def _ensure_embedding_column(self) -> None:
         """Add embedding column to blocks table if missing (Postgres only)."""
