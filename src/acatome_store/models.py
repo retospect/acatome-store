@@ -1,19 +1,28 @@
 """SQLAlchemy ORM models for acatome-store.
 
-Schema overview:
+Schema overview (v3):
+  ``corpora``     — Document type registry (string PK).  Each corpus defines
+                    a handler, slug pattern, default tags, and write policy.
   ``block_types`` — Lookup table for block kinds (string PK).  Carries a
                     ``provenance`` flag ("original" | "generated") so
-                    consumers always know what is the paper vs. what is
-                    LLM-generated.
-  ``refs``        — Paper identity (auto int PK).  One row per known paper,
-                    ingested or stub.  DOI/S2/arxiv are nullable UNIQUE
-                    lookup handles.  The citation graph references this table.
-  ``papers``      — Ingested content (1:1 FK to refs).  Slug, PDF hash,
-                    bundle path, verified flag.
+                    consumers always know what is original vs. LLM-generated.
+  ``refs``        — Document identity (auto int PK).  One row per known
+                    document (paper, note, todo, wiki page, etc.), ingested
+                    or stub.  DOI/S2/arxiv are nullable UNIQUE lookup handles.
+                    Polymorphic on ``corpus_id``.
+  ``papers``      — Ingestion receipt (1:1 FK to refs).  PDF hash, bundle
+                    path, verified flag.  Only exists when content is ingested.
   ``blocks``      — Text chunks + synthetic blocks (FK → refs).  Abstract
-                    and paper summary are blocks with special ``block_type``.
-  ``citations``   — Directed graph edges.  Both FKs → refs.
-  ``notes``       — User annotations on refs or blocks.
+                    and document summary are blocks with special ``block_type``.
+  ``link_types``  — Relation registry (name PK, inverse label).  Defines
+                    valid edge types for the link graph.
+  ``links``       — Slug-based edges between refs or blocks.  Nullable
+                    node_id fields allow doc→doc, doc→block, block→block.
+                    Replaces the older ``citations`` table.
+
+Deprecated (kept for migration compatibility):
+  ``citations``   — Use ``links`` with relation='cites' instead.
+  ``notes``       — Use refs in the 'notes' corpus with 'annotates' links.
 
 Portable across SQLite, Postgres, and MySQL via connection string.
 On Postgres, ``blocks.embedding`` uses pgvector for native ANN search.
@@ -21,11 +30,12 @@ On Postgres, ``blocks.embedding`` uses pgvector for native ANN search.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -54,10 +64,17 @@ BLOCK_TYPE_SEEDS = [
     ("figure", "original", "Extracted figure / caption"),
     ("list", "original", "Extracted list block"),
     ("equation", "original", "Extracted equation"),
-    ("abstract", "original", "Paper abstract"),
-    ("paper_summary", "generated", "LLM-generated paper summary"),
+    ("abstract", "original", "Abstract or executive summary"),
+    ("document_summary", "generated", "LLM-generated document summary"),
     ("block_summary", "generated", "LLM-generated block summary"),
     ("junk", "original", "Frontmatter boilerplate (copyright, reviewer info, etc.)"),
+    # Legal / regulatory block types
+    ("provision", "original", "Statutory provision or rule"),
+    ("definition", "original", "Defined term"),
+    ("worksheet", "original", "Tax worksheet or calculation"),
+    ("example", "original", "Worked example or illustration"),
+    ("form_ref", "original", "Reference to a specific form"),
+    ("amendment", "original", "Amendment or revision note"),
 ]
 
 
@@ -80,7 +97,73 @@ def seed_block_types(session: Session) -> None:
 
 
 # ---------------------------------------------------------------------------
-# refs — paper identity (one row per known paper, ingested or stub)
+# corpora — document type registry (string PK, config table)
+# ---------------------------------------------------------------------------
+
+CORPUS_SEEDS = [
+    ("papers", "Scientific Papers", "paper", "ingestion",
+     "{author}{year}{keyword}", '["papers"]',
+     "Peer-reviewed scientific literature"),
+    ("irs", "IRS Publications", "reference", "ingestion",
+     "irs-pub{number}-{year}", '["irs", "tax", "us"]',
+     "US Internal Revenue Service publications and form instructions"),
+    ("us-code", "US Code", "statute", "ingestion",
+     "usc{title}-s{section}", '["us-code", "law", "us"]',
+     "United States Code \u2014 federal statutes"),
+    ("ie-acts", "Irish Acts", "statute", "ingestion",
+     "ie-{abbrev}{year}", '["ie-acts", "law", "ie"]',
+     "Acts of the Oireachtas (Irish primary legislation)"),
+    ("ie-revenue", "Irish Revenue Manuals", "reference", "ingestion",
+     "ie-tdm-{id}", '["ie-revenue", "tax", "ie"]',
+     "Revenue Tax and Duty Manuals (Ireland)"),
+    ("notes", "Notes & Annotations", "note", "direct",
+     "note:{hash}", '["notes"]',
+     "User and agent annotations on documents and blocks"),
+    ("todos", "Todo Items", "todo", "direct",
+     "todo:{title}", '["todos"]',
+     "Task items with state, priority, and due dates"),
+    ("wiki", "Knowledge Wiki", "wiki", "direct",
+     "wiki:{title}", '["wiki"]',
+     "Agent-writable knowledge pages"),
+    ("journal", "Journal", "journal", "direct",
+     "journal:{title}", '["journal"]',
+     "Conversation summaries and decisions"),
+]
+
+
+class Corpus(Base):
+    __tablename__ = "corpora"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    label: Mapped[str] = mapped_column(String, nullable=False)
+    handler: Mapped[str] = mapped_column(String, nullable=False, default="paper")
+    write_policy: Mapped[str] = mapped_column(
+        String, nullable=False, default="ingestion"
+    )  # ingestion | direct | system
+    slug_pattern: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    default_tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+def seed_corpora(session: Session) -> None:
+    """Insert or update seed rows in corpora."""
+    for id_, label, handler, write_policy, pattern, tags, desc in CORPUS_SEEDS:
+        existing = session.get(Corpus, id_)
+        if existing:
+            # Update write_policy for existing corpora (migration)
+            if not existing.write_policy or existing.write_policy == "ingestion":
+                existing.write_policy = write_policy
+        else:
+            session.add(Corpus(
+                id=id_, label=label, handler=handler,
+                write_policy=write_policy,
+                slug_pattern=pattern, default_tags=tags, description=desc,
+            ))
+    session.commit()
+
+
+# ---------------------------------------------------------------------------
+# refs — document identity (one row per known document, ingested or stub)
 # ---------------------------------------------------------------------------
 
 
@@ -88,19 +171,20 @@ class Ref(Base):
     __tablename__ = "refs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    corpus_id: Mapped[str] = mapped_column(
+        ForeignKey("corpora.id"), nullable=False, default="papers"
+    )
+    slug: Mapped[Optional[str]] = mapped_column(String, unique=True, nullable=True)
     doi: Mapped[Optional[str]] = mapped_column(String, unique=True, nullable=True)
     s2_id: Mapped[Optional[str]] = mapped_column(String, unique=True, nullable=True)
     arxiv_id: Mapped[Optional[str]] = mapped_column(String, unique=True, nullable=True)
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     authors: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
     year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    journal: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    entry_type: Mapped[str] = mapped_column(String, default="article")
+    published_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     keywords: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
-    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
-    retracted: Mapped[bool] = mapped_column(Boolean, default=False)
-    retraction_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    meta: Mapped[Optional[str]] = mapped_column("metadata", Text, nullable=True)  # JSON object
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
@@ -127,10 +211,62 @@ class Ref(Base):
         foreign_keys="Citation.cited_id",
     )
 
-    __table_args__ = (Index("idx_refs_year", "year"),)
+    __table_args__ = (
+        Index("idx_refs_year", "year"),
+        Index("idx_refs_corpus", "corpus_id"),
+        Index("idx_refs_slug", "slug"),
+    )
+
+    __mapper_args__ = {
+        "polymorphic_on": "corpus_id",
+        "polymorphic_identity": "papers",
+    }
+
+    # ── Metadata helpers ──────────────────────────────────────────────
+
+    @property
+    def _meta(self) -> dict[str, Any]:
+        """Parsed metadata JSON (cached per access)."""
+        import json as _json
+        if not self.meta:
+            return {}
+        try:
+            return _json.loads(self.meta)
+        except (ValueError, TypeError):
+            return {}
+
+    def _set_meta_field(self, key: str, value: Any) -> None:
+        """Set a single field in the metadata JSON."""
+        import json as _json
+        m = self._meta
+        m[key] = value
+        self.meta = _json.dumps(m)
+
+    # Paper-specific accessors (on base class for backward compat)
+    @property
+    def journal(self) -> str | None:
+        return self._meta.get("journal")
+
+    @property
+    def entry_type(self) -> str:
+        return self._meta.get("entry_type", "article")
+
+    @property
+    def source(self) -> str | None:
+        return self._meta.get("source")
+
+    @property
+    def retracted(self) -> bool:
+        return self._meta.get("retracted", False)
+
+    @property
+    def retraction_note(self) -> str | None:
+        return self._meta.get("retraction_note")
 
     def to_dict(self) -> dict[str, Any]:
         d = {c.name: getattr(self, c.name) for c in self.__table__.columns}
+        # Expose metadata fields at top level for backward compat
+        d.update(self._meta)
         # Merge paper fields if ingested
         if self.paper:
             d.update(self.paper.to_dict())
@@ -142,7 +278,7 @@ class Ref(Base):
 
 
 # ---------------------------------------------------------------------------
-# papers — ingested content (1:1 extension of refs)
+# papers — ingestion receipt (1:1 extension of refs, any corpus)
 # ---------------------------------------------------------------------------
 
 
@@ -152,7 +288,6 @@ class Paper(Base):
     ref_id: Mapped[int] = mapped_column(
         ForeignKey("refs.id", ondelete="CASCADE"), primary_key=True
     )
-    slug: Mapped[Optional[str]] = mapped_column(String, unique=True, nullable=True)
     pdf_hash: Mapped[str] = mapped_column(String, nullable=False)
     bundle_path: Mapped[str] = mapped_column(Text, nullable=False)
     verified: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -215,7 +350,78 @@ class Block(Base):
 
 
 # ---------------------------------------------------------------------------
-# citations — directed graph edges (both FKs → refs)
+# link_types — relation registry (name PK, inverse label)
+# ---------------------------------------------------------------------------
+
+LINK_TYPE_SEEDS = [
+    ("cites", "cited_by", "Formal citation or reference"),
+    ("discusses", "discussed_in", "Substantive discussion of"),
+    ("summarizes", "summarized_by", "Distilled summary of"),
+    ("annotates", "annotated_by", "Note or annotation on"),
+    ("contradicts", "contradicted_by", "Contradictory claim"),
+    ("supports", "supported_by", "Supporting evidence"),
+    ("supersedes", "superseded_by", "Newer version replaces older"),
+    ("cross_references", "cross_referenced_by", "Legal/statutory cross-ref"),
+    ("responds_to", "has_response", "Conversation response"),
+    ("depends_on", "depended_on_by", "Prerequisite relationship"),
+    ("contains", "contained_in", "Parent-child hierarchy"),
+    ("references", "referenced_by", "Generic inline reference"),
+]
+
+
+class LinkType(Base):
+    __tablename__ = "link_types"
+
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    inverse: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+def seed_link_types(session: Session) -> None:
+    """Insert seed rows into link_types if they don't exist."""
+    for name, inverse, desc in LINK_TYPE_SEEDS:
+        if not session.get(LinkType, name):
+            session.add(LinkType(name=name, inverse=inverse, description=desc))
+    session.commit()
+
+
+# ---------------------------------------------------------------------------
+# links — slug-based edges between refs or blocks
+# ---------------------------------------------------------------------------
+
+
+class Link(Base):
+    __tablename__ = "links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    src_slug: Mapped[str] = mapped_column(String, nullable=False)
+    src_node_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    dst_slug: Mapped[str] = mapped_column(String, nullable=False)
+    dst_node_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    relation: Mapped[str] = mapped_column(
+        ForeignKey("link_types.name"), nullable=False, default="cites"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+
+    link_type: Mapped[LinkType] = relationship()
+
+    __table_args__ = (
+        Index("idx_links_src", "src_slug"),
+        Index("idx_links_dst", "dst_slug"),
+        Index("idx_links_src_node", "src_slug", "src_node_id"),
+        Index("idx_links_dst_node", "dst_slug", "dst_node_id"),
+        Index("idx_links_relation", "relation"),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED: citations — use links with relation='cites' instead
 # ---------------------------------------------------------------------------
 
 
@@ -238,7 +444,7 @@ class Citation(Base):
 
 
 # ---------------------------------------------------------------------------
-# notes — user annotations on refs or blocks
+# DEPRECATED: notes — use refs in 'notes' corpus with 'annotates' links
 # ---------------------------------------------------------------------------
 
 

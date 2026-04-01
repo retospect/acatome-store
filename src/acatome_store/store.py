@@ -1,18 +1,20 @@
 """Core Store class: ingest, search, metadata queries.
 
 Persistence:
-  - Relational data (refs, papers, blocks, citations) → SQLAlchemy ORM
-    (portable across SQLite, Postgres, MySQL via connection string)
-  - Vector search → Chroma (LlamaIndex) or pgvector (SQLAlchemy column)
+  - Relational data (corpora, refs, papers, blocks, links) via SQLAlchemy
+    ORM (portable across SQLite, Postgres, MySQL via connection string)
+  - Vector search via Chroma (LlamaIndex) or pgvector (SQLAlchemy column)
 
 Identity model:
-  - ``Ref`` = one row per known paper (ingested or stub). Holds DOI,
-    S2 ID, arxiv ID, title, etc.  Auto-int PK.
-  - ``Paper`` = ingested content (1:1 optional on Ref). Slug, PDF hash,
-    bundle path. Only exists when we have a PDF.
-  - ``Block`` = text chunks from ingested papers (FK → Paper).
-  - ``Citation`` = directed edge (citing_ref → cited_ref). Both FKs
-    point to Ref, so the graph spans ingested + stub papers.
+  - ``Corpus`` = document type registry with write policy.
+  - ``Ref`` = one row per known document (paper, note, todo, wiki, etc.).
+    Holds slug, DOI, S2 ID, arxiv ID, title, etc.  Auto-int PK.
+    Polymorphic on ``corpus_id``.
+  - ``Paper`` = ingestion receipt (1:1 optional on Ref). PDF hash,
+    bundle path. Only exists when content is ingested.
+  - ``Block`` = text chunks from ingested documents (FK to Ref).
+  - ``Link`` = slug-based edge between refs or blocks. Replaces Citation.
+  - ``LinkType`` = relation registry (cites/cited_by, annotates, etc.).
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -34,11 +37,16 @@ from acatome_store.config import StoreConfig
 from acatome_store.models import (
     Base,
     Block,
+    Corpus,
+    Link,
+    LinkType,
     Note,
     Paper,
     Ref,
     create_blocks_view,
     seed_block_types,
+    seed_corpora,
+    seed_link_types,
 )
 from acatome_store.vector import VectorIndex, create_index
 
@@ -170,9 +178,11 @@ class Store:
             self._ensure_embedding_column()
             self._ensure_missing_columns()
 
-        # Seed block_types lookup and create convenience view
+        # Seed lookup tables and create convenience view
         with self._Session() as session:
+            seed_corpora(session)
             seed_block_types(session)
+            seed_link_types(session)
         try:
             create_blocks_view(self._engine)
         except Exception:
@@ -182,6 +192,11 @@ class Store:
         """Add missing columns to existing tables (Postgres only)."""
         migrations = [
             ("refs", "tags", "TEXT"),
+            ("refs", "corpus_id", "VARCHAR DEFAULT 'papers' REFERENCES corpora(id)"),
+            ("refs", "slug", "VARCHAR UNIQUE"),
+            ("refs", "published_date", "DATE"),
+            ("refs", "metadata", "TEXT"),
+            ("corpora", "write_policy", "VARCHAR DEFAULT 'ingestion'"),
             ("notes", "origin", "VARCHAR"),
         ]
         try:
@@ -271,16 +286,9 @@ class Store:
             ref = Ref()
             session.add(ref)
 
-        # Update fields (fill in blanks, never overwrite with None)
-        for field in (
-            "doi",
-            "s2_id",
-            "arxiv_id",
-            "title",
-            "journal",
-            "entry_type",
-            "source",
-        ):
+        # Update direct columns (fill in blanks, never overwrite with None)
+        # Note: slug is NOT set here — ingest() handles it after collision check
+        for field in ("doi", "s2_id", "arxiv_id", "title"):
             val = header.get(field)
             if val and not getattr(ref, field, None):
                 setattr(ref, field, val)
@@ -294,6 +302,17 @@ class Store:
             if not ref.keywords:
                 ref.keywords = json.dumps(header["keywords"])
 
+        # Metadata JSON: journal, entry_type, source, etc.
+        meta = ref._meta.copy() if ref.meta else {}
+        for meta_field in ("journal", "entry_type", "source"):
+            val = header.get(meta_field)
+            if val and not meta.get(meta_field):
+                meta[meta_field] = val
+        if meta and not ref.meta:
+            ref.meta = json.dumps(meta)
+        elif meta:
+            ref.meta = json.dumps(meta)
+
         session.flush()  # ensure ref.id is assigned
         return ref
 
@@ -303,6 +322,27 @@ class Store:
         existing: list[str] = json.loads(ref.tags) if ref.tags else []
         merged = sorted(set(existing) | set(new_tags))
         ref.tags = json.dumps(merged)
+
+    @staticmethod
+    def _disambiguate_slug(session: Session, base_slug: str) -> str:
+        """Append a/b/c… suffix to make a slug unique."""
+        for suffix in "abcdefghijklmnopqrstuvwxyz":
+            candidate = f"{base_slug}{suffix}"
+            exists = session.execute(
+                select(Ref).where(Ref.slug == candidate)
+            ).scalar_one_or_none()
+            if not exists:
+                return candidate
+        # Extremely unlikely: 26 collisions — fall back to numeric
+        n = 2
+        while True:
+            candidate = f"{base_slug}{n}"
+            exists = session.execute(
+                select(Ref).where(Ref.slug == candidate)
+            ).scalar_one_or_none()
+            if not exists:
+                return candidate
+            n += 1
 
     # ------------------------------------------------------------------
     # Ingest
@@ -327,7 +367,7 @@ class Store:
         bundle_path = Path(bundle_path)
         data = _read_bundle(bundle_path)
         header = data["header"]
-        slug = header.get("slug", "")
+        slug = header.get("slug", "").replace("~", "")  # ~ reserved as URI separator
         pdf_hash = header["pdf_hash"]
 
         with self._Session() as session:
@@ -350,17 +390,15 @@ class Store:
             if ref.paper and ref.paper.pdf_hash != pdf_hash:
                 return ref.id
 
-            # Slug collision: slug taken by a different ref
+            # Slug collision: auto-disambiguate with a/b/c… suffix
             if slug:
-                existing = session.execute(
-                    select(Paper).where(Paper.slug == slug)
+                existing_ref = session.execute(
+                    select(Ref).where(Ref.slug == slug)
                 ).scalar_one_or_none()
-                if existing and existing.ref_id != ref.id:
-                    raise ValueError(
-                        f"Slug collision: '{slug}' already belongs to "
-                        f"ref_id={existing.ref_id}. "
-                        f"Resolve manually or rename."
-                    )
+                if existing_ref and existing_ref.id != ref.id:
+                    slug = self._disambiguate_slug(session, slug)
+                    log.info("slug collision → %s", slug)
+                ref.slug = slug or None
 
             # Atomic replace: delete old Paper + blocks if re-ingesting
             if ref.paper:
@@ -370,10 +408,9 @@ class Store:
                 session.delete(old_block)
             session.flush()
 
-            # Insert Paper
+            # Insert Paper (ingestion receipt)
             paper = Paper(
                 ref_id=ref.id,
-                slug=slug or None,
                 pdf_hash=pdf_hash,
                 bundle_path=str(bundle_path.resolve()),
                 verified=bool(header.get("verified")),
@@ -396,23 +433,23 @@ class Store:
                     )
                 )
 
-            # Insert paper summary as a block (if present)
+            # Insert document summary as a block (if present)
             enrich_meta = data.get("enrichment_meta") or {}
             # New format: paper_summaries dict; old format: paper_summary string
             paper_summaries = enrich_meta.get("paper_summaries") or {}
-            paper_summary = pick_best_summary(paper_summaries) or enrich_meta.get(
+            doc_summary = pick_best_summary(paper_summaries) or enrich_meta.get(
                 "paper_summary", ""
             )
-            if paper_summary:
+            if doc_summary:
                 session.add(
                     Block(
-                        node_id=f"ref:{ref.id}:paper_summary",
+                        node_id=f"ref:{ref.id}:document_summary",
                         profile="default",
                         ref_id=ref.id,
                         page=None,
                         block_index=None,
-                        block_type="paper_summary",
-                        text=paper_summary,
+                        block_type="document_summary",
+                        text=doc_summary,
                     )
                 )
 
@@ -500,6 +537,123 @@ class Store:
         return ref_id
 
     # ------------------------------------------------------------------
+    # Direct ref creation (for direct-write corpora: todos, wiki, notes)
+    # ------------------------------------------------------------------
+
+    def create_ref(
+        self,
+        slug: str,
+        *,
+        corpus_id: str = "papers",
+        title: str = "",
+        metadata: dict[str, Any] | None = None,
+        tags: list[str] | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> int:
+        """Create a ref directly (no .acatome bundle needed).
+
+        For use by direct-write corpora (todos, wiki, notes, journal).
+        Raises ValueError if slug already exists or corpus not found.
+
+        Args:
+            slug: Unique slug for the ref.
+            corpus_id: Corpus this ref belongs to.
+            title: Human-readable title.
+            metadata: JSON-serialisable dict stored in ref.metadata.
+            tags: Optional list of tags.
+            blocks: Optional list of block dicts with keys:
+                text, block_type (default "text"), section_path (default []).
+
+        Returns:
+            ref_id (int) of the created ref.
+        """
+        if not slug:
+            raise ValueError("slug is required for create_ref()")
+        if "~" in slug:
+            raise ValueError(
+                f"slug must not contain '~' (reserved as URI selector separator): {slug}"
+            )
+
+        with self._Session() as session:
+            # Validate corpus exists
+            corpus = session.get(Corpus, corpus_id)
+            if not corpus:
+                raise ValueError(f"Unknown corpus: {corpus_id}")
+
+            # Check slug uniqueness
+            existing = session.execute(
+                select(Ref).where(Ref.slug == slug)
+            ).scalar_one_or_none()
+            if existing:
+                raise ValueError(f"Slug already exists: {slug}")
+
+            ref = Ref(
+                corpus_id=corpus_id,
+                slug=slug,
+                title=title or None,
+            )
+            if metadata:
+                ref.meta = json.dumps(metadata)
+            session.add(ref)
+            session.flush()  # get ref.id
+
+            if tags:
+                self._merge_tags(ref, tags)
+
+            # Insert blocks
+            for i, b in enumerate(blocks or []):
+                node_id = f"{slug}-b{i:04d}"
+                block = Block(
+                    node_id=node_id,
+                    profile="default",
+                    ref_id=ref.id,
+                    page=0,
+                    block_index=i,
+                    block_type=b.get("block_type", "text"),
+                    text=b.get("text", ""),
+                    section_path=json.dumps(b.get("section_path", [])),
+                )
+                session.add(block)
+
+            session.commit()
+            return ref.id
+
+    def update_ref_metadata(
+        self,
+        slug: str,
+        metadata: dict[str, Any],
+        *,
+        merge: bool = True,
+    ) -> None:
+        """Update the metadata JSON for a ref.
+
+        Args:
+            slug: Ref slug to update.
+            metadata: Dict of keys to set.
+            merge: If True (default), merge with existing metadata.
+                   If False, replace entirely.
+
+        Raises ValueError if ref not found.
+        """
+        with self._Session() as session:
+            ref = session.execute(
+                select(Ref).where(Ref.slug == slug)
+            ).scalar_one_or_none()
+            if not ref:
+                raise ValueError(f"Ref not found: {slug}")
+
+            if merge and ref.meta:
+                try:
+                    existing = json.loads(ref.meta)
+                except (ValueError, TypeError):
+                    existing = {}
+                existing.update(metadata)
+                ref.meta = json.dumps(existing)
+            else:
+                ref.meta = json.dumps(metadata)
+            session.commit()
+
+    # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------
 
@@ -572,7 +726,7 @@ class Store:
     # ------------------------------------------------------------------
 
     def get(self, identifier) -> dict[str, Any] | None:
-        """Get paper by ref_id (int), slug, or DOI.
+        """Get document by ref_id (int), slug, or DOI.
 
         Returns merged ref + paper dict, or None.
         """
@@ -583,14 +737,12 @@ class Store:
             if isinstance(identifier, int):
                 ref = session.get(Ref, identifier)
             elif isinstance(identifier, str):
-                # Try slug
-                paper = session.execute(
-                    select(Paper)
-                    .options(joinedload(Paper.ref))
-                    .where(Paper.slug == identifier)
+                # Try slug (on Ref)
+                ref = session.execute(
+                    select(Ref)
+                    .options(joinedload(Ref.paper))
+                    .where(Ref.slug == identifier)
                 ).scalar_one_or_none()
-                if paper:
-                    ref = paper.ref
 
                 # Try DOI
                 if not ref:
@@ -641,6 +793,140 @@ class Store:
             stmt = stmt.order_by(Block.page, Block.block_index)
             rows = session.execute(stmt).scalars().all()
             return [r.to_dict() for r in rows]
+
+    def update_block_text(
+        self,
+        identifier,
+        node_id: str,
+        text: str,
+    ) -> None:
+        """Update the text content of a specific block.
+
+        Args:
+            identifier: ref_id (int), slug, or DOI.
+            node_id: The block's node_id.
+            text: New text content.
+
+        Raises ValueError if ref or block not found.
+        """
+        paper = self.get(identifier)
+        if not paper or "ref_id" not in paper:
+            raise ValueError(f"Ref not found: {identifier}")
+        ref_id = paper["ref_id"]
+        with self._Session() as session:
+            block = session.execute(
+                select(Block).where(
+                    Block.ref_id == ref_id,
+                    Block.node_id == node_id,
+                )
+            ).scalar_one_or_none()
+            if not block:
+                raise ValueError(f"Block not found: {node_id} in ref {identifier}")
+            block.text = text
+            session.commit()
+
+    # ------------------------------------------------------------------
+    # Figures
+    # ------------------------------------------------------------------
+
+    _FIG_NUM_RE = re.compile(
+        r"(?:Fig(?:ure)?\.?\s*|Scheme\s*)(\d+)", re.IGNORECASE
+    )
+
+    def get_figures(self, identifier) -> list[dict[str, Any]]:
+        """Get figure metadata for a paper, with parsed figure numbers.
+
+        Returns list of dicts: {fig_num, caption, page, block_index, node_id}.
+        Figures are numbered by caption label (Fig 1, Figure 2, Scheme 3).
+        Figures without a parseable number are assigned sequentially.
+        """
+        blocks = self.get_blocks(identifier, block_type="figure")
+        figures: list[dict[str, Any]] = []
+        next_auto = 1
+        used_nums: set[int] = set()
+
+        # First pass: extract explicit numbers
+        for b in blocks:
+            caption = b.get("text", "")
+            m = self._FIG_NUM_RE.search(caption)
+            num = int(m.group(1)) if m else None
+            if num is not None:
+                used_nums.add(num)
+            figures.append({
+                "fig_num": num,
+                "caption": caption,
+                "page": b.get("page"),
+                "block_index": b.get("block_index"),
+                "node_id": b.get("node_id", ""),
+            })
+
+        # Second pass: assign auto numbers to figures without explicit labels
+        for fig in figures:
+            if fig["fig_num"] is None:
+                while next_auto in used_nums:
+                    next_auto += 1
+                fig["fig_num"] = next_auto
+                used_nums.add(next_auto)
+                next_auto += 1
+
+        return figures
+
+    def get_figure_image(
+        self, identifier, fig_num: int
+    ) -> dict[str, Any] | None:
+        """Get figure image data from the bundle.
+
+        Args:
+            identifier: slug, ref_id, or DOI.
+            fig_num: Figure number (from caption label).
+
+        Returns:
+            Dict with keys: fig_num, caption, page, image_bytes, image_ext,
+            or None if not found.
+        """
+        # Find the figure metadata
+        figures = self.get_figures(identifier)
+        fig_meta = next((f for f in figures if f["fig_num"] == fig_num), None)
+        if fig_meta is None:
+            return None
+
+        # Read the bundle to get image bytes
+        paper = self.get(identifier)
+        if not paper:
+            return None
+
+        with self._Session() as session:
+            paper_row = session.execute(
+                select(Paper).where(Paper.ref_id == paper["ref_id"])
+            ).scalar_one_or_none()
+            if not paper_row or not paper_row.bundle_path:
+                return None
+            bundle_path = Path(paper_row.bundle_path)
+
+        if not bundle_path.exists():
+            return None
+
+        data = _read_bundle(bundle_path)
+        # Match by node_id (reliable across bundle and store)
+        target_node_id = fig_meta["node_id"]
+        for block in data.get("blocks", []):
+            if (block.get("node_id") == target_node_id
+                    and block.get("type") == "figure"):
+                b64 = block.get("image_base64", "")
+                mime = block.get("image_mime", "image/png")
+                if not b64:
+                    return None
+                import base64
+                ext = ".png" if "png" in mime else ".jpg"
+                return {
+                    "fig_num": fig_num,
+                    "caption": fig_meta["caption"],
+                    "page": fig_meta["page"],
+                    "image_bytes": base64.b64decode(b64),
+                    "image_ext": ext,
+                }
+
+        return None
 
     def get_toc(
         self, identifier, supplement: str | None = None
@@ -742,18 +1028,30 @@ class Store:
             pass
         return True
 
-    def list_papers(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-        """List ingested papers (joined with ref metadata)."""
+    def list_papers(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        since: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """List ingested papers (joined with ref metadata).
+
+        Args:
+            limit: Max papers to return.
+            offset: Pagination offset.
+            since: Only return papers ingested on or after this datetime (UTC, naive).
+        """
         with self._Session() as session:
+            stmt = (
+                select(Ref)
+                .join(Paper)
+                .options(joinedload(Ref.paper))
+                .order_by(Paper.ingested_at.desc())
+            )
+            if since is not None:
+                stmt = stmt.where(Paper.ingested_at >= since)
             rows = (
-                session.execute(
-                    select(Ref)
-                    .join(Paper)
-                    .options(joinedload(Ref.paper))
-                    .order_by(Paper.ingested_at.desc())
-                    .limit(limit)
-                    .offset(offset)
-                )
+                session.execute(stmt.limit(limit).offset(offset))
                 .unique()
                 .scalars()
                 .all()
@@ -771,15 +1069,25 @@ class Store:
                         kw = json.loads(r.keywords)
                     except (json.JSONDecodeError, TypeError):
                         kw = r.keywords
+                tags: list[str] = []
+                if r.tags:
+                    try:
+                        tags = json.loads(r.tags)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
                 result.append(
                     {
                         "ref_id": r.id,
-                        "slug": r.paper.slug if r.paper else None,
+                        "slug": r.slug,
                         "title": r.title,
+                        "authors": r.authors,
                         "year": r.year,
                         "doi": r.doi,
+                        "corpus_id": r.corpus_id,
                         "block_count": block_count,
                         "keywords": kw,
+                        "tags": tags,
+                        "ingested_at": r.paper.ingested_at if r.paper else None,
                     }
                 )
             return result
@@ -827,7 +1135,175 @@ class Store:
         return info
 
     # ------------------------------------------------------------------
-    # Notes
+    # Links
+    # ------------------------------------------------------------------
+
+    def create_link(
+        self,
+        src_slug: str,
+        dst_slug: str,
+        relation: str = "cites",
+        *,
+        src_node_id: str | None = None,
+        dst_node_id: str | None = None,
+    ) -> Link:
+        """Create a link between two refs or blocks.
+
+        Args:
+            src_slug: Source ref slug.
+            dst_slug: Target ref slug.
+            relation: Link type name (must exist in link_types table).
+            src_node_id: Optional source block node_id.
+            dst_node_id: Optional target block node_id.
+
+        Returns:
+            The created Link object.
+
+        Raises:
+            ValueError: If relation is not a valid link type, or if
+                src_slug/dst_slug don't resolve to existing refs.
+        """
+        with self._Session() as session:
+            # Validate relation
+            lt = session.get(LinkType, relation)
+            if not lt:
+                valid = [r.name for r in session.execute(select(LinkType)).scalars()]
+                raise ValueError(
+                    f"Unknown link relation '{relation}'. "
+                    f"Valid types: {', '.join(sorted(valid))}"
+                )
+            # Validate source ref exists
+            src_ref = session.execute(
+                select(Ref).where(Ref.slug == src_slug)
+            ).scalar_one_or_none()
+            if not src_ref:
+                raise ValueError(f"Source ref not found: '{src_slug}'")
+            # Validate target ref exists
+            dst_ref = session.execute(
+                select(Ref).where(Ref.slug == dst_slug)
+            ).scalar_one_or_none()
+            if not dst_ref:
+                raise ValueError(f"Target ref not found: '{dst_slug}'")
+
+            link = Link(
+                src_slug=src_slug,
+                src_node_id=src_node_id,
+                dst_slug=dst_slug,
+                dst_node_id=dst_node_id,
+                relation=relation,
+            )
+            session.add(link)
+            session.commit()
+            session.refresh(link)
+            return link
+
+    def get_links(
+        self,
+        slug: str,
+        *,
+        node_id: str | None = None,
+        relation: str | None = None,
+        direction: str = "both",
+    ) -> list[dict[str, Any]]:
+        """Get links for a ref or block.
+
+        Args:
+            slug: Ref slug.
+            node_id: Optional block node_id (filters to block-level links).
+            relation: Optional filter by link type name.
+            direction: 'outbound', 'inbound', or 'both'.
+
+        Returns:
+            List of link dicts, each with an extra 'display_relation' key
+            showing the natural-language label from the viewing side.
+
+        Raises:
+            ValueError: If direction is not one of 'outbound', 'inbound', 'both'.
+        """
+        if direction not in ("outbound", "inbound", "both"):
+            raise ValueError(
+                f"Invalid direction '{direction}', must be 'outbound', 'inbound', or 'both'"
+            )
+        results = []
+        with self._Session() as session:
+            # Build outbound query (this slug is src)
+            if direction in ("outbound", "both"):
+                q = select(Link).where(Link.src_slug == slug)
+                if node_id is not None:
+                    q = q.where(Link.src_node_id == node_id)
+                if relation:
+                    q = q.where(Link.relation == relation)
+                q = q.order_by(Link.created_at)
+                for link in session.execute(q).scalars():
+                    d = link.to_dict()
+                    d["display_relation"] = link.relation
+                    d["direction"] = "outbound"
+                    results.append(d)
+
+            # Build inbound query (this slug is dst)
+            if direction in ("inbound", "both"):
+                q = select(Link).where(Link.dst_slug == slug)
+                if node_id is not None:
+                    q = q.where(Link.dst_node_id == node_id)
+                if relation:
+                    q = q.where(Link.relation == relation)
+                q = q.order_by(Link.created_at)
+                for link in session.execute(q).scalars():
+                    d = link.to_dict()
+                    # Use inverse label for inbound links
+                    lt = session.get(LinkType, link.relation)
+                    d["display_relation"] = lt.inverse if lt else link.relation
+                    d["direction"] = "inbound"
+                    results.append(d)
+
+        return results
+
+    def get_link_count(self, slug: str) -> dict[str, int]:
+        """Get link counts for a ref, grouped by display relation.
+
+        Returns:
+            Dict mapping display_relation to count.
+            E.g. {"cites": 3, "cited_by": 5, "annotated_by": 2}
+        """
+        links = self.get_links(slug)
+        counts: dict[str, int] = {}
+        for link in links:
+            rel = link["display_relation"]
+            counts[rel] = counts.get(rel, 0) + 1
+        return counts
+
+    def delete_link(self, link_id: int) -> bool:
+        """Delete a link by ID.
+
+        Returns:
+            True if deleted, False if link not found.
+        """
+        with self._Session() as session:
+            link = session.get(Link, link_id)
+            if not link:
+                return False
+            session.delete(link)
+            session.commit()
+            return True
+
+    def delete_links_for_slug(self, slug: str) -> int:
+        """Delete all links where slug is src or dst.
+
+        Returns:
+            Number of links deleted.
+        """
+        from sqlalchemy import or_, delete as sa_delete
+
+        with self._Session() as session:
+            stmt = sa_delete(Link).where(
+                or_(Link.src_slug == slug, Link.dst_slug == slug)
+            )
+            result = session.execute(stmt)
+            session.commit()
+            return result.rowcount
+
+    # ------------------------------------------------------------------
+    # Notes (DEPRECATED — use links with relation='annotates')
     # ------------------------------------------------------------------
 
     def add_note(
@@ -1084,7 +1560,7 @@ class Store:
                 if tag in tags:
                     results.append({
                         "ref_id": r.id,
-                        "slug": r.paper.slug if r.paper else None,
+                        "slug": r.slug,
                         "title": r.title,
                         "year": r.year,
                         "tags": tags,
@@ -1107,7 +1583,7 @@ class Store:
     # ------------------------------------------------------------------
 
     def retract(self, identifier, note: str = "") -> bool:
-        """Mark a paper as retracted.
+        """Mark a document as retracted.
 
         Args:
             identifier: ref_id (int), slug, or DOI.
@@ -1123,13 +1599,14 @@ class Store:
             ref = session.get(Ref, paper_dict["id"])
             if not ref:
                 return False
-            ref.retracted = True
-            ref.retraction_note = note or None
+            ref._set_meta_field("retracted", True)
+            if note:
+                ref._set_meta_field("retraction_note", note)
             session.commit()
         return True
 
     def unretract(self, identifier) -> bool:
-        """Remove retraction flag from a paper."""
+        """Remove retraction flag from a document."""
         paper_dict = self.get(identifier)
         if not paper_dict or "id" not in paper_dict:
             return False
@@ -1137,8 +1614,8 @@ class Store:
             ref = session.get(Ref, paper_dict["id"])
             if not ref:
                 return False
-            ref.retracted = False
-            ref.retraction_note = None
+            ref._set_meta_field("retracted", False)
+            ref._set_meta_field("retraction_note", None)
             session.commit()
         return True
 

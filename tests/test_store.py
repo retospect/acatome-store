@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from sqlalchemy import select
+
+from acatome_store.models import Paper, Ref
 from acatome_store.store import Store
 
 
@@ -57,8 +60,11 @@ class TestIngest:
         with gzip.open(collision_path, "wt") as f:
             json.dump(data, f)
 
-        with pytest.raises(ValueError, match="Slug collision"):
-            store.ingest(collision_path)
+        ref_id = store.ingest(collision_path)
+        # Should auto-disambiguate to smith2024quantuma
+        with store._Session() as session:
+            ref = session.get(Ref, ref_id)
+            assert ref.slug == "smith2024quantuma"
 
 
 class TestReembed:
@@ -255,12 +261,15 @@ class TestDelete:
     def test_delete(self, store, sample_bundle):
         ref_id = store.ingest(sample_bundle)
         assert store.delete("smith2024quantum") is True
-        # Slug lookup returns None (Paper deleted)
-        assert store.get("smith2024quantum") is None
-        # But DOI lookup still finds the Ref stub
-        stub = store.get("10.1038/s41567-024-1234-5")
+        # Slug is on Ref now, so stub is still findable by slug
+        stub = store.get("smith2024quantum")
         assert stub is not None
-        assert "slug" not in stub or stub.get("slug") is None
+        assert stub["slug"] == "smith2024quantum"
+        # Paper (ingestion receipt) is gone — no pdf_hash etc.
+        assert "pdf_hash" not in stub or stub.get("pdf_hash") is None
+        # Also findable by DOI
+        stub2 = store.get("10.1038/s41567-024-1234-5")
+        assert stub2 is not None
 
     def test_delete_not_found(self, store):
         assert store.delete("nonexistent") is False
