@@ -15,8 +15,9 @@ from __future__ import annotations
 import gzip
 import json
 import os
-import pytest
 from pathlib import Path
+
+import pytest
 
 from acatome_store.config import StoreConfig
 from acatome_store.models import Base

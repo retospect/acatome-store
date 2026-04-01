@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from sqlalchemy import select
-
-from acatome_store.models import Paper, Ref
-from acatome_store.store import Store
+from acatome_store.models import Ref
 
 
 class TestIngest:
@@ -33,7 +30,8 @@ class TestIngest:
         assert store.stats()["total_papers"] == 2
 
     def test_slug_collision_fails(self, store, sample_bundle, tmp_path):
-        import gzip, json
+        import gzip
+        import json
 
         store.ingest(sample_bundle)
 
@@ -72,7 +70,8 @@ class TestReembed:
 
     def test_matching_model_no_reembed(self, store, tmp_path):
         """When bundle model matches system config, embeddings pass through."""
-        import gzip, json
+        import gzip
+        import json
         from unittest.mock import patch
 
         data = {
@@ -122,7 +121,8 @@ class TestReembed:
 
     def test_mismatched_model_triggers_reembed(self, store, tmp_path):
         """When bundle model differs from system config, blocks are re-embedded."""
-        import gzip, json
+        import gzip
+        import json
         from unittest.mock import patch
 
         data = {
@@ -172,7 +172,8 @@ class TestReembed:
 
     def test_no_enrichment_meta_triggers_reembed(self, store, tmp_path):
         """When bundle has no enrichment_meta, blocks are re-embedded."""
-        import gzip, json
+        import gzip
+        import json
         from unittest.mock import patch
 
         data = {
@@ -383,7 +384,6 @@ class TestNotes:
         store.delete("smith2024quantum")
         # Block note should be gone (block deleted via CASCADE)
         assert store.get_notes(block_node_id=node_id) == []
-
 
     def test_add_note_with_origin(self, store, sample_bundle):
         ref_id = store.ingest(sample_bundle)

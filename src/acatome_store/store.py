@@ -23,15 +23,15 @@ import gzip
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
-
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session, joinedload, sessionmaker
+from typing import Any
 
 from precis_summary import pick_best_summary
 from precis_summary.rake import telegram_precis
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from acatome_store.config import StoreConfig
 from acatome_store.models import (
@@ -308,9 +308,7 @@ class Store:
             val = header.get(meta_field)
             if val and not meta.get(meta_field):
                 meta[meta_field] = val
-        if meta and not ref.meta:
-            ref.meta = json.dumps(meta)
-        elif meta:
+        if (meta and not ref.meta) or meta:
             ref.meta = json.dumps(meta)
 
         session.flush()  # ensure ref.id is assigned
@@ -348,9 +346,7 @@ class Store:
     # Ingest
     # ------------------------------------------------------------------
 
-    def ingest(
-        self, bundle_path: str | Path, *, tags: list[str] | None = None
-    ) -> int:
+    def ingest(self, bundle_path: str | Path, *, tags: list[str] | None = None) -> int:
         """Ingest a .acatome bundle into the store.
 
         Dedup rules:
@@ -710,13 +706,10 @@ class Store:
         from sqlalchemy import tuple_
 
         with self._Session() as session:
-            stmt = (
-                select(Block.ref_id, Block.block_index, Block.summary)
-                .where(
-                    tuple_(Block.ref_id, Block.block_index).in_(keys),
-                    Block.summary.isnot(None),
-                    Block.profile == "default",
-                )
+            stmt = select(Block.ref_id, Block.block_index, Block.summary).where(
+                tuple_(Block.ref_id, Block.block_index).in_(keys),
+                Block.summary.isnot(None),
+                Block.profile == "default",
             )
             rows = session.execute(stmt).all()
             return {(r[0], r[1]): r[2] for r in rows if r[2]}
@@ -829,9 +822,7 @@ class Store:
     # Figures
     # ------------------------------------------------------------------
 
-    _FIG_NUM_RE = re.compile(
-        r"(?:Fig(?:ure)?\.?\s*|Scheme\s*)(\d+)", re.IGNORECASE
-    )
+    _FIG_NUM_RE = re.compile(r"(?:Fig(?:ure)?\.?\s*|Scheme\s*)(\d+)", re.IGNORECASE)
 
     def get_figures(self, identifier) -> list[dict[str, Any]]:
         """Get figure metadata for a paper, with parsed figure numbers.
@@ -852,13 +843,15 @@ class Store:
             num = int(m.group(1)) if m else None
             if num is not None:
                 used_nums.add(num)
-            figures.append({
-                "fig_num": num,
-                "caption": caption,
-                "page": b.get("page"),
-                "block_index": b.get("block_index"),
-                "node_id": b.get("node_id", ""),
-            })
+            figures.append(
+                {
+                    "fig_num": num,
+                    "caption": caption,
+                    "page": b.get("page"),
+                    "block_index": b.get("block_index"),
+                    "node_id": b.get("node_id", ""),
+                }
+            )
 
         # Second pass: assign auto numbers to figures without explicit labels
         for fig in figures:
@@ -871,9 +864,7 @@ class Store:
 
         return figures
 
-    def get_figure_image(
-        self, identifier, fig_num: int
-    ) -> dict[str, Any] | None:
+    def get_figure_image(self, identifier, fig_num: int) -> dict[str, Any] | None:
         """Get figure image data from the bundle.
 
         Args:
@@ -910,13 +901,13 @@ class Store:
         # Match by node_id (reliable across bundle and store)
         target_node_id = fig_meta["node_id"]
         for block in data.get("blocks", []):
-            if (block.get("node_id") == target_node_id
-                    and block.get("type") == "figure"):
+            if block.get("node_id") == target_node_id and block.get("type") == "figure":
                 b64 = block.get("image_base64", "")
                 mime = block.get("image_mime", "image/png")
                 if not b64:
                     return None
                 import base64
+
                 ext = ".png" if "png" in mime else ".jpg"
                 return {
                     "fig_num": fig_num,
@@ -1292,7 +1283,8 @@ class Store:
         Returns:
             Number of links deleted.
         """
-        from sqlalchemy import or_, delete as sa_delete
+        from sqlalchemy import delete as sa_delete
+        from sqlalchemy import or_
 
         with self._Session() as session:
             stmt = sa_delete(Link).where(
@@ -1558,13 +1550,15 @@ class Store:
             for r in refs:
                 tags: list[str] = json.loads(r.tags) if r.tags else []
                 if tag in tags:
-                    results.append({
-                        "ref_id": r.id,
-                        "slug": r.slug,
-                        "title": r.title,
-                        "year": r.year,
-                        "tags": tags,
-                    })
+                    results.append(
+                        {
+                            "ref_id": r.id,
+                            "slug": r.slug,
+                            "title": r.title,
+                            "year": r.year,
+                            "tags": tags,
+                        }
+                    )
             return results
 
     def list_tags(self) -> dict[str, int]:

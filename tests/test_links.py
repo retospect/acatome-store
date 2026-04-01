@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from acatome_store.models import Link, LinkType, Corpus
+from acatome_store.models import Corpus, LinkType
 
 
 class TestLinkTypes:
@@ -12,8 +12,9 @@ class TestLinkTypes:
 
     def test_link_types_seeded(self, store):
         """All seed link types are present after store init."""
-        from acatome_store.models import LINK_TYPE_SEEDS
         from sqlalchemy import select
+
+        from acatome_store.models import LINK_TYPE_SEEDS
 
         with store._Session() as session:
             rows = session.execute(select(LinkType)).scalars().all()
@@ -47,14 +48,12 @@ class TestCorpusWritePolicy:
                 )
 
     def test_papers_are_ingestion(self, store):
-        from sqlalchemy import select
 
         with store._Session() as session:
             papers = session.get(Corpus, "papers")
             assert papers.write_policy == "ingestion"
 
     def test_notes_are_direct(self, store):
-        from sqlalchemy import select
 
         with store._Session() as session:
             notes = session.get(Corpus, "notes")
@@ -62,7 +61,6 @@ class TestCorpusWritePolicy:
             assert notes.write_policy == "direct"
 
     def test_todos_are_direct(self, store):
-        from sqlalchemy import select
 
         with store._Session() as session:
             todos = session.get(Corpus, "todos")
@@ -90,7 +88,9 @@ class TestCreateLink:
         store.ingest(second_bundle)
 
         link = store.create_link(
-            "smith2024quantum", "jones2023surface", "discusses",
+            "smith2024quantum",
+            "jones2023surface",
+            "discusses",
             src_node_id="doi:10.1038/s41567-024-1234-5-p00-000",
             dst_node_id="doi:10.1103/PhysRevLett.123.456-p00-000",
         )
@@ -98,7 +98,9 @@ class TestCreateLink:
         assert link.dst_node_id == "doi:10.1103/PhysRevLett.123.456-p00-000"
         assert link.relation == "discusses"
 
-    def test_create_link_invalid_relation_raises(self, store, sample_bundle, second_bundle):
+    def test_create_link_invalid_relation_raises(
+        self, store, sample_bundle, second_bundle
+    ):
         store.ingest(sample_bundle)
         store.ingest(second_bundle)
 
@@ -117,7 +119,9 @@ class TestCreateLink:
         with pytest.raises(ValueError, match="Target ref not found"):
             store.create_link("smith2024quantum", "nonexistent", "cites")
 
-    def test_create_link_default_relation_is_cites(self, store, sample_bundle, second_bundle):
+    def test_create_link_default_relation_is_cites(
+        self, store, sample_bundle, second_bundle
+    ):
         store.ingest(sample_bundle)
         store.ingest(second_bundle)
 
@@ -248,7 +252,9 @@ class TestBlockLevelLinks:
         # Create doc-level and block-level links
         store.create_link("smith2024quantum", "jones2023surface", "cites")
         store.create_link(
-            "smith2024quantum", "jones2023surface", "discusses",
+            "smith2024quantum",
+            "jones2023surface",
+            "discusses",
             src_node_id="doi:10.1038/s41567-024-1234-5-p00-000",
         )
 
