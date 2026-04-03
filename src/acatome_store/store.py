@@ -154,7 +154,7 @@ class Store:
             try:
                 from acatome_store.models import add_pgvector_column
 
-                add_pgvector_column()
+                add_pgvector_column(self._config.embed_dim)
             except ImportError:
                 pass
 
@@ -514,6 +514,11 @@ class Store:
                 if embedder:
                     try:
                         blocks = _reembed_blocks(blocks, embedder)
+                        # Write embeddings back to bundle so future reingests skip this
+                        _update_bundle_embeddings(
+                            bundle_path, data, blocks, self._config.embed_model,
+                            self._config.embed_dim,
+                        )
                     except Exception:
                         log.warning("Re-embedding failed, skipping vector index")
                         blocks = []  # skip indexing
@@ -1613,10 +1618,53 @@ class Store:
             session.commit()
         return True
 
+    def reset_schema(self) -> None:
+        """Drop all tables and recreate from the current model.
+
+        WARNING: destroys all data. Use for dev/reingest workflows only.
+        """
+        # Drop dependent views first (Postgres blocks DROP TABLE otherwise)
+        if self._config.db_url.startswith("postgresql"):
+            from sqlalchemy import text
+
+            with self._engine.connect() as conn:
+                conn.execute(text("DROP VIEW IF EXISTS blocks_v CASCADE"))
+                conn.commit()
+        Base.metadata.drop_all(self._engine)
+        self._init_db()
+
     def close(self) -> None:
         """Dispose of the engine."""
         if hasattr(self, "_engine"):
             self._engine.dispose()
+
+
+def _update_bundle_embeddings(
+    bundle_path: Path,
+    data: dict[str, Any],
+    blocks: list[dict[str, Any]],
+    embed_model: str,
+    embed_dim: int,
+) -> None:
+    """Write re-embedded blocks back into the .acatome bundle.
+
+    Updates the blocks' embeddings and enrichment_meta so future
+    reingests don't need to re-embed.
+    """
+    data["blocks"] = blocks
+    em = data.get("enrichment_meta") or {}
+    models = em.get("embedding_models") or {}
+    models["default"] = {"model": embed_model, "dim": embed_dim}
+    em["embedding_models"] = models
+    em.setdefault("profiles", [])
+    if "default" not in em["profiles"]:
+        em["profiles"].append("default")
+    data["enrichment_meta"] = em
+    try:
+        with gzip.open(bundle_path, "wt", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        log.warning("Failed to write embeddings back to %s", bundle_path)
 
 
 def _read_bundle(path: str | Path) -> dict[str, Any]:

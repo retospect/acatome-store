@@ -195,8 +195,9 @@ class PgVectorIndex(VectorIndex):
     table, ANN search is a normal SQLAlchemy query.
     """
 
-    def __init__(self, session_factory):
+    def __init__(self, session_factory, embed_model: str = "all-MiniLM-L6-v2"):
         self._session_factory = session_factory
+        self._embed_model_name = embed_model
 
     def add_blocks(
         self,
@@ -283,7 +284,7 @@ class PgVectorIndex(VectorIndex):
         from sentence_transformers import SentenceTransformer
 
         if not hasattr(self, "_st_model"):
-            self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+            self._st_model = SentenceTransformer(self._embed_model_name)
         emb = self._st_model.encode(query).tolist()
 
         # Build SQLAlchemy filters from Chroma-style where dict
@@ -380,6 +381,6 @@ def create_index(
     if backend == "postgres":
         if session_factory is None:
             raise ValueError("session_factory is required for postgres vector backend")
-        return PgVectorIndex(session_factory)
+        return PgVectorIndex(session_factory, embed_model=config.embed_model)
 
     raise ValueError(f"Unknown vector backend: {backend!r}")

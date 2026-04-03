@@ -4,6 +4,22 @@ All notable changes to **acatome-store** will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] — 2026-04-02
+
+### Added
+
+- `reingest` CLI command: re-ingest all bundles from `~/.acatome/papers/`
+  - `--drop` flag: drop schema and recreate before ingesting (with confirmation)
+  - `--path` / `-p`: override bundle directory
+- `Store.reset_schema()`: drop all tables and recreate from current model
+
+### Fixed
+
+- Schema drift: old `entry_type`, `journal`, `source`, `retracted`, `retraction_note`
+  columns removed from Ref model in v0.6.0 but not from Postgres — caused
+  `NotNullViolation` on every INSERT. Fix: drop stale columns via `reset_schema()`
+  or `reingest --drop`.
+
 ## [0.6.0] — 2026-04-01
 
 ### Added

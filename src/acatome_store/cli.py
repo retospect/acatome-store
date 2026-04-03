@@ -100,6 +100,61 @@ def info(
 
 
 @app.command()
+def reingest(
+    path: Path = typer.Option(
+        None, "--path", "-p", help="Bundle directory (default: ~/.acatome/papers)",
+    ),
+    drop: bool = typer.Option(False, "--drop", help="Drop and recreate schema first"),
+):
+    """Re-ingest all .acatome bundles from the papers directory."""
+    import time
+
+    from acatome_store.store import Store
+
+    store = Store()
+
+    if path is None:
+        path = store._config.store_path.parent / "papers"
+
+    if not path.is_dir():
+        typer.echo(f"Error: {path} is not a directory", err=True)
+        raise typer.Exit(1)
+
+    bundles = sorted(path.rglob("*.acatome"))
+    if not bundles:
+        typer.echo(f"No .acatome bundles found in {path}")
+        raise typer.Exit(1)
+
+    if drop:
+        typer.confirm(
+            f"This will DROP all tables and re-ingest {len(bundles)} bundles. Continue?",
+            abort=True,
+        )
+        store.reset_schema()
+        typer.echo("Schema reset.")
+
+    typer.echo(f"Ingesting {len(bundles)} bundles from {path}")
+    t0 = time.time()
+    succeeded, failed = 0, 0
+    for i, b in enumerate(bundles, 1):
+        try:
+            store.ingest(b)
+            succeeded += 1
+        except Exception as e:
+            failed += 1
+            typer.echo(f"  ✗ {b.name}: {e}")
+        if i % 100 == 0:
+            elapsed = time.time() - t0
+            rate = i / elapsed
+            eta = (len(bundles) - i) / rate
+            typer.echo(f"  [{i}/{len(bundles)}] {succeeded} ok, {failed} fail — {rate:.0f}/s, ETA {eta:.0f}s")
+
+    elapsed = time.time() - t0
+    typer.echo(f"\nDone: {succeeded} ingested, {failed} failed, {elapsed:.1f}s")
+    store.close()
+
+
+@app.command()
 def stats():
     """Show store statistics."""
     from acatome_store.store import Store

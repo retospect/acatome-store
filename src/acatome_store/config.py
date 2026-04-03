@@ -31,9 +31,9 @@ class StoreConfig:
     pg_password: str = ""
 
     # Embedding profile ("default" profile from extract config)
-    embed_model: str = "all-MiniLM-L6-v2"
-    embed_dim: int = 384
-    embed_provider: str = "chroma"
+    embed_model: str = "BAAI/bge-m3"
+    embed_dim: int = 1024
+    embed_provider: str = "sentence-transformers"
     embed_index_dim: int | None = None
 
     @property
@@ -75,8 +75,8 @@ class StoreConfig:
             pg_schema=cfg.store.pg_schema,
             pg_user=cfg.store.pg_user,
             pg_password=cfg.store.pg_password,
-            embed_model=profile.model if profile else "all-MiniLM-L6-v2",
-            embed_dim=profile.dim if profile else 384,
-            embed_provider=profile.provider if profile else "chroma",
+            embed_model=profile.model if profile else "BAAI/bge-m3",
+            embed_dim=profile.dim if profile else 1024,
+            embed_provider=profile.provider if profile else "sentence-transformers",
             embed_index_dim=profile.index_dim if profile else None,
         )
