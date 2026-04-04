@@ -102,7 +102,10 @@ def info(
 @app.command()
 def reingest(
     path: Path = typer.Option(
-        None, "--path", "-p", help="Bundle directory (default: ~/.acatome/papers)",
+        None,
+        "--path",
+        "-p",
+        help="Bundle directory (default: ~/.acatome/papers)",
     ),
     drop: bool = typer.Option(False, "--drop", help="Drop and recreate schema first"),
 ):
@@ -147,7 +150,9 @@ def reingest(
             elapsed = time.time() - t0
             rate = i / elapsed
             eta = (len(bundles) - i) / rate
-            typer.echo(f"  [{i}/{len(bundles)}] {succeeded} ok, {failed} fail — {rate:.0f}/s, ETA {eta:.0f}s")
+            typer.echo(
+                f"  [{i}/{len(bundles)}] {succeeded} ok, {failed} fail — {rate:.0f}/s, ETA {eta:.0f}s"
+            )
 
     elapsed = time.time() - t0
     typer.echo(f"\nDone: {succeeded} ingested, {failed} failed, {elapsed:.1f}s")

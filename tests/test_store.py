@@ -125,6 +125,7 @@ class TestReembed:
         import json
         from unittest.mock import patch
 
+        dim = store._config.embed_dim
         data = {
             "header": {
                 "paper_id": "doi:10.1234/mismatch",
@@ -164,9 +165,13 @@ class TestReembed:
 
         from acatome_store import store as store_mod
 
-        with patch.object(
-            store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks
-        ) as mock_reembed:
+        dummy_embedder = lambda texts: [[0.0] * dim for _ in texts]
+        with (
+            patch.object(
+                store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks
+            ) as mock_reembed,
+            patch.object(store_mod, "_get_embedder", return_value=dummy_embedder),
+        ):
             store.ingest(path)
             mock_reembed.assert_called_once()
 
@@ -176,6 +181,7 @@ class TestReembed:
         import json
         from unittest.mock import patch
 
+        dim = store._config.embed_dim
         data = {
             "header": {
                 "paper_id": "doi:10.1234/noenrich",
@@ -211,9 +217,13 @@ class TestReembed:
 
         from acatome_store import store as store_mod
 
-        with patch.object(
-            store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks
-        ) as mock_reembed:
+        dummy_embedder = lambda texts: [[0.0] * dim for _ in texts]
+        with (
+            patch.object(
+                store_mod, "_reembed_blocks", wraps=store_mod._reembed_blocks
+            ) as mock_reembed,
+            patch.object(store_mod, "_get_embedder", return_value=dummy_embedder),
+        ):
             store.ingest(path)
             mock_reembed.assert_called_once()
 

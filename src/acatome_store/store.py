@@ -516,7 +516,10 @@ class Store:
                         blocks = _reembed_blocks(blocks, embedder)
                         # Write embeddings back to bundle so future reingests skip this
                         _update_bundle_embeddings(
-                            bundle_path, data, blocks, self._config.embed_model,
+                            bundle_path,
+                            data,
+                            blocks,
+                            self._config.embed_model,
                             self._config.embed_dim,
                         )
                     except Exception:
