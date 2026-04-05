@@ -217,5 +217,82 @@ def unretract(
     store.close()
 
 
+@app.command()
+def catalog(
+    output: Path = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Output file (default: stdout). Use .tsv or .csv extension.",
+    ),
+    fmt: str = typer.Option(
+        "tsv", "--format", "-f", help="Output format: tsv (default) or csv"
+    ),
+):
+    """Export paper metadata catalog (slug, title, authors, year, DOI, blocks)."""
+    import csv
+    import io
+    import json as _json
+
+    from acatome_store.store import Store
+
+    store = Store()
+    papers = store.list_papers(limit=100000)
+    store.close()
+
+    if not papers:
+        typer.echo("No papers in store.", err=True)
+        raise typer.Exit(1)
+
+    delimiter = "\t" if fmt == "tsv" else ","
+    fields = ["slug", "year", "first_author", "title", "doi", "block_count"]
+
+    if output is None:
+        buf = io.StringIO()
+    else:
+        buf = open(output, "w", newline="")  # noqa: SIM115
+    try:
+        writer = csv.DictWriter(buf, fieldnames=fields, delimiter=delimiter)
+        writer.writeheader()
+        for p in papers:
+            # Extract first author surname
+            first_author = ""
+            raw = p.get("authors", "")
+            if raw:
+                try:
+                    authors = _json.loads(raw) if isinstance(raw, str) else raw
+                    if authors and isinstance(authors, list):
+                        name = (
+                            authors[0].get("name", "")
+                            if isinstance(authors[0], dict)
+                            else str(authors[0])
+                        )
+                        first_author = (
+                            name.split(",")[0].strip()
+                            if "," in name
+                            else name.split()[-1]
+                            if name.split()
+                            else ""
+                        )
+                except (ValueError, TypeError, IndexError):
+                    pass
+            writer.writerow(
+                {
+                    "slug": p.get("slug", ""),
+                    "year": p.get("year", ""),
+                    "first_author": first_author,
+                    "title": p.get("title", ""),
+                    "doi": p.get("doi", ""),
+                    "block_count": p.get("block_count", 0),
+                }
+            )
+        if output is None:
+            typer.echo(buf.getvalue(), nl=False)
+        else:
+            typer.echo(f"✓ {len(papers)} papers → {output}")
+    finally:
+        buf.close()
+
+
 if __name__ == "__main__":
     app()

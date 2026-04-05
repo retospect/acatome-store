@@ -363,7 +363,9 @@ class Store:
         bundle_path = Path(bundle_path)
         data = _read_bundle(bundle_path)
         header = data["header"]
-        slug = header.get("slug", "").replace("~", "")  # ~ reserved as URI separator
+        slug = (
+            header.get("slug", "").replace("~", "").replace("\u203a", "")
+        )  # separators reserved
         pdf_hash = header["pdf_hash"]
 
         with self._Session() as session:
@@ -573,9 +575,9 @@ class Store:
         """
         if not slug:
             raise ValueError("slug is required for create_ref()")
-        if "~" in slug:
+        if "~" in slug or "\u203a" in slug:
             raise ValueError(
-                f"slug must not contain '~' (reserved as URI selector separator): {slug}"
+                f"slug must not contain '~' or '\u203a' (reserved as URI selector separator): {slug}"
             )
 
         with self._Session() as session:
