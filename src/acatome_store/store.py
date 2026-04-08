@@ -329,19 +329,32 @@ class Store:
         # First author surname
         surname = "anon"
         if authors:
-            name = authors[0].get("name", "") if isinstance(authors[0], dict) else str(authors[0])
+            name = (
+                authors[0].get("name", "")
+                if isinstance(authors[0], dict)
+                else str(authors[0])
+            )
             if name and ";" in name:
                 name = name.split(";")[0].strip()
             surname = name.split(",")[0].strip().lower() if name else "anon"
-        surname = unicodedata.normalize("NFKD", surname).encode("ascii", "ignore").decode()
+        surname = (
+            unicodedata.normalize("NFKD", surname).encode("ascii", "ignore").decode()
+        )
         surname = re.sub(r"[^a-z]", "", surname)[:30] or "anon"
         yr = str(year) if year else "0000"
-        ascii_title = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+        ascii_title = (
+            unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+        )
         words = re.findall(r"[a-z]+", ascii_title.lower())
         keyword = next((w for w in words if w not in _STOP), words[0] if words else "")
         if not keyword:
             import hashlib
-            keyword = hashlib.sha256(title.encode()).hexdigest()[:6] if title.strip() else "untitled"
+
+            keyword = (
+                hashlib.sha256(title.encode()).hexdigest()[:6]
+                if title.strip()
+                else "untitled"
+            )
         return f"{surname}{yr}{keyword}"
 
     @staticmethod
