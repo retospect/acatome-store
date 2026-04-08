@@ -165,6 +165,15 @@ CORPUS_SEEDS = [
         "Task items with state, priority, and due dates",
     ),
     (
+        "flashcards",
+        "Flashcards",
+        "flashcard",
+        "direct",
+        "fc:{hash}",
+        '["flashcards"]',
+        "Knowledge items with SM-2 spaced repetition",
+    ),
+    (
         "wiki",
         "Knowledge Wiki",
         "wiki",
