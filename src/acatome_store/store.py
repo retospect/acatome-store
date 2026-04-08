@@ -23,6 +23,7 @@ import gzip
 import json
 import logging
 import re
+import unicodedata
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -322,6 +323,28 @@ class Store:
         ref.tags = json.dumps(merged)
 
     @staticmethod
+    def _make_slug(authors: list[dict], year: int | None, title: str) -> str:
+        """Generate human-readable slug: {surname}{year}{keyword}."""
+        _STOP = {"a", "an", "the", "new", "on", "of", "in", "for", "to", "and", "with"}
+        # First author surname
+        surname = "anon"
+        if authors:
+            name = authors[0].get("name", "") if isinstance(authors[0], dict) else str(authors[0])
+            if name and ";" in name:
+                name = name.split(";")[0].strip()
+            surname = name.split(",")[0].strip().lower() if name else "anon"
+        surname = unicodedata.normalize("NFKD", surname).encode("ascii", "ignore").decode()
+        surname = re.sub(r"[^a-z]", "", surname)[:30] or "anon"
+        yr = str(year) if year else "0000"
+        ascii_title = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+        words = re.findall(r"[a-z]+", ascii_title.lower())
+        keyword = next((w for w in words if w not in _STOP), words[0] if words else "")
+        if not keyword:
+            import hashlib
+            keyword = hashlib.sha256(title.encode()).hexdigest()[:6] if title.strip() else "untitled"
+        return f"{surname}{yr}{keyword}"
+
+    @staticmethod
     def _disambiguate_slug(session: Session, base_slug: str) -> str:
         """Append a/b/c… suffix to make a slug unique."""
         for suffix in "abcdefghijklmnopqrstuvwxyz":
@@ -388,15 +411,22 @@ class Store:
             if ref.paper and ref.paper.pdf_hash != pdf_hash:
                 return ref.id
 
+            # Generate slug from metadata if bundle didn't provide one
+            if not slug:
+                slug = self._make_slug(
+                    header.get("authors", []),
+                    header.get("year"),
+                    header.get("title", ""),
+                )
+
             # Slug collision: auto-disambiguate with a/b/c… suffix
-            if slug:
-                existing_ref = session.execute(
-                    select(Ref).where(Ref.slug == slug)
-                ).scalar_one_or_none()
-                if existing_ref and existing_ref.id != ref.id:
-                    slug = self._disambiguate_slug(session, slug)
-                    log.info("slug collision → %s", slug)
-                ref.slug = slug or None
+            existing_ref = session.execute(
+                select(Ref).where(Ref.slug == slug)
+            ).scalar_one_or_none()
+            if existing_ref and existing_ref.id != ref.id:
+                slug = self._disambiguate_slug(session, slug)
+                log.info("slug collision → %s", slug)
+            ref.slug = slug
 
             # Atomic replace: delete old Paper + blocks if re-ingesting
             if ref.paper:
