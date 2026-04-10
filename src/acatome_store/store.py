@@ -174,10 +174,10 @@ class Store:
         Base.metadata.create_all(self._engine)
         self._Session = sessionmaker(bind=self._engine)
 
-        # Auto-migrate: add missing columns if Postgres
+        # Auto-migrate: add missing columns for existing databases
         if is_pg:
             self._ensure_embedding_column()
-            self._ensure_missing_columns()
+        self._ensure_missing_columns(is_pg)
 
         # Seed lookup tables and create convenience view
         with self._Session() as session:
@@ -189,32 +189,61 @@ class Store:
         except Exception:
             pass  # SQLite doesn't support CREATE OR REPLACE VIEW in all versions
 
-    def _ensure_missing_columns(self) -> None:
-        """Add missing columns to existing tables (Postgres only)."""
+    def _ensure_missing_columns(self, is_pg: bool) -> None:
+        """Add missing columns to existing tables (Postgres and SQLite)."""
+        # (table, column, pg_type, sqlite_type)
+        # SQLite doesn't support UNIQUE in ALTER TABLE ADD COLUMN,
+        # so we add a separate CREATE UNIQUE INDEX step below.
         migrations = [
-            ("refs", "tags", "TEXT"),
-            ("refs", "corpus_id", "VARCHAR DEFAULT 'papers' REFERENCES corpora(id)"),
-            ("refs", "slug", "VARCHAR UNIQUE"),
-            ("refs", "published_date", "DATE"),
-            ("refs", "metadata", "TEXT"),
-            ("corpora", "write_policy", "VARCHAR DEFAULT 'ingestion'"),
-            ("notes", "origin", "VARCHAR"),
+            ("refs", "tags", "TEXT", "TEXT"),
+            ("refs", "corpus_id",
+             "VARCHAR DEFAULT 'papers' REFERENCES corpora(id)",
+             "VARCHAR DEFAULT 'papers'"),
+            ("refs", "slug", "VARCHAR UNIQUE", "VARCHAR"),
+            ("refs", "published_date", "DATE", "DATE"),
+            ("refs", "metadata", "TEXT", "TEXT"),
+            ("corpora", "write_policy",
+             "VARCHAR DEFAULT 'ingestion'", "VARCHAR DEFAULT 'ingestion'"),
+            ("notes", "origin", "VARCHAR", "VARCHAR"),
         ]
         try:
             from sqlalchemy import text
 
             with self._engine.connect() as conn:
-                for table, column, col_type in migrations:
-                    row = conn.execute(
-                        text(
-                            "SELECT 1 FROM information_schema.columns "
-                            f"WHERE table_name='{table}' AND column_name='{column}'"
-                        )
-                    ).fetchone()
+                for table, column, pg_type, sqlite_type in migrations:
+                    if is_pg:
+                        row = conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.columns "
+                                f"WHERE table_name='{table}' AND column_name='{column}'"
+                            )
+                        ).fetchone()
+                    else:
+                        rows = conn.execute(
+                            text(f"PRAGMA table_info('{table}')")
+                        ).fetchall()
+                        if not rows:
+                            continue  # table doesn't exist, skip
+                        row = any(r[1] == column for r in rows)
                     if not row:
+                        col_type = pg_type if is_pg else sqlite_type
                         conn.execute(
-                            text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                            text(
+                                f"ALTER TABLE {table} "
+                                f"ADD COLUMN {column} {col_type}"
+                            )
                         )
+                # SQLite: add unique index for slug (replaces inline UNIQUE)
+                if not is_pg:
+                    try:
+                        conn.execute(
+                            text(
+                                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                                "idx_refs_slug_unique ON refs(slug)"
+                            )
+                        )
+                    except Exception:
+                        pass  # index may already exist
                 conn.commit()
         except Exception:
             pass  # non-fatal

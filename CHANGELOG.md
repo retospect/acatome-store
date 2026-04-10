@@ -4,6 +4,16 @@ All notable changes to **acatome-store** will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.5] — 2026-04-10
+
+### Fixed
+
+- SQLite auto-migration: `_ensure_missing_columns()` now runs on all backends,
+  not just Postgres. Users upgrading from pre-0.6.0 SQLite databases no longer
+  get `no such column: refs.corpus_id` errors.
+- SQLite DDL compatibility: split `REFERENCES` + `DEFAULT` (forbidden together)
+  and `UNIQUE` (forbidden in ALTER TABLE ADD COLUMN) into separate statements.
+
 ## [0.7.0] — 2026-04-02
 
 ### Added
