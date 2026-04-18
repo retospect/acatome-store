@@ -232,7 +232,8 @@ def catalog(
     """Export paper metadata catalog (slug, title, authors, year, DOI, blocks)."""
     import csv
     import io
-    import json as _json
+
+    from acatome_meta.literature import first_author_surname
 
     from acatome_store.store import Store
 
@@ -255,32 +256,11 @@ def catalog(
         writer = csv.DictWriter(buf, fieldnames=fields, delimiter=delimiter)
         writer.writeheader()
         for p in papers:
-            # Extract first author surname
-            first_author = ""
-            raw = p.get("authors", "")
-            if raw:
-                try:
-                    authors = _json.loads(raw) if isinstance(raw, str) else raw
-                    if authors and isinstance(authors, list):
-                        name = (
-                            authors[0].get("name", "")
-                            if isinstance(authors[0], dict)
-                            else str(authors[0])
-                        )
-                        first_author = (
-                            name.split(",")[0].strip()
-                            if "," in name
-                            else name.split()[-1]
-                            if name.split()
-                            else ""
-                        )
-                except (ValueError, TypeError, IndexError):
-                    pass
             writer.writerow(
                 {
                     "slug": p.get("slug", ""),
                     "year": p.get("year", ""),
-                    "first_author": first_author,
+                    "first_author": first_author_surname(p.get("authors", "")),
                     "title": p.get("title", ""),
                     "doi": p.get("doi", ""),
                     "block_count": p.get("block_count", 0),

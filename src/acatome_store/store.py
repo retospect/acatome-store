@@ -23,15 +23,21 @@ import gzip
 import json
 import logging
 import re
-import unicodedata
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from acatome_meta.literature import (
+    SKIP_EMBED_TYPES,
+    EmbedderUnavailableError,
+    build_embedder,
+    make_slug as _lit_make_slug,
+)
 from precis_summary import pick_best_summary
 from precis_summary.rake import telegram_precis
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from acatome_store.config import StoreConfig
@@ -53,51 +59,23 @@ from acatome_store.vector import VectorIndex, create_index
 
 log = logging.getLogger(__name__)
 
-# Block types that skip embedding (same as acatome_extract.enrich)
-_SKIP_EMBED_TYPES = {"section_header", "title", "author", "equation", "junk"}
-
 
 def _get_embedder(
     config: StoreConfig,
-) -> Callable[[list[str]], list[list[float]]] | None:
+) -> Callable[[list[str]], list[list[float]]]:
     """Build an embedding function from the store's configured profile.
 
-    Returns None if the embedding backend is unavailable.
+    Raises:
+        EmbedderUnavailableError: if the configured backend is not installed;
+            message includes the ``pip install`` incantation.
+        ValueError: if ``config.embed_provider`` is not recognised.
     """
-    if config.embed_provider == "chroma":
-        try:
-            from chromadb.utils.embedding_functions import (
-                DefaultEmbeddingFunction,
-            )
-
-            ef = DefaultEmbeddingFunction()
-
-            def _chroma_embed(texts: list[str]) -> list[list[float]]:
-                results = ef(texts)
-                return [
-                    e.tolist() if hasattr(e, "tolist") else list(e) for e in results
-                ]
-
-            return _chroma_embed
-        except Exception:
-            return None
-
-    if config.embed_provider == "sentence-transformers":
-        try:
-            from sentence_transformers import SentenceTransformer
-
-            model = SentenceTransformer(config.embed_model)
-            dim = config.embed_index_dim or config.embed_dim
-
-            def _st_embed(texts: list[str]) -> list[list[float]]:
-                embs = model.encode(texts, normalize_embeddings=True)
-                return [e[:dim].tolist() for e in embs]
-
-            return _st_embed
-        except Exception:
-            return None
-
-    return None
+    return build_embedder(
+        provider=config.embed_provider,
+        model=config.embed_model,
+        dim=config.embed_dim,
+        index_dim=config.embed_index_dim,
+    )
 
 
 def _reembed_blocks(
@@ -109,7 +87,7 @@ def _reembed_blocks(
     texts = []
     indices = []
     for i, b in enumerate(blocks):
-        if b.get("type") in _SKIP_EMBED_TYPES:
+        if b.get("type") in SKIP_EMBED_TYPES:
             continue
         text = b.get("text", "").strip()
         if not text:
@@ -186,8 +164,10 @@ class Store:
             seed_link_types(session)
         try:
             create_blocks_view(self._engine)
-        except Exception:
-            pass  # SQLite doesn't support CREATE OR REPLACE VIEW in all versions
+        except (OperationalError, ProgrammingError) as exc:
+            # SQLite pre-3.44 lacks CREATE OR REPLACE VIEW; the view is a
+            # convenience for human SQL queries and not required for runtime.
+            log.debug("Skipped blocks_v view creation: %s", exc)
 
     def _ensure_missing_columns(self, is_pg: bool) -> None:
         """Add missing columns to existing tables (Postgres and SQLite)."""
@@ -242,11 +222,14 @@ class Store:
                                 "idx_refs_slug_unique ON refs(slug)"
                             )
                         )
-                    except Exception:
-                        pass  # index may already exist
+                    except OperationalError as exc:
+                        log.debug("Slug index already present: %s", exc)
                 conn.commit()
-        except Exception:
-            pass  # non-fatal
+        except (OperationalError, ProgrammingError) as exc:
+            # Column already present or table missing — auto-migration is
+            # best-effort for legacy databases; real schema errors surface
+            # from create_all() above.
+            log.debug("Schema auto-migration skipped: %s", exc)
 
     def _ensure_embedding_column(self) -> None:
         """Add embedding column to blocks table if missing (Postgres only)."""
@@ -266,8 +249,15 @@ class Store:
                         text("ALTER TABLE blocks ADD COLUMN embedding vector(384)")
                     )
                 conn.commit()
-        except Exception:
-            pass  # pgvector not installed or other issue — non-fatal
+        except (OperationalError, ProgrammingError) as exc:
+            # pgvector extension unavailable on this server; vector search
+            # will fall back to a non-pg backend or fail explicitly when used.
+            log.warning(
+                "Could not provision pgvector embedding column: %s. "
+                "Install the pgvector extension on the Postgres server, or "
+                "set vector_backend='chroma' in acatome config.",
+                exc,
+            )
 
     @property
     def index(self) -> VectorIndex:
@@ -351,40 +341,7 @@ class Store:
         merged = sorted(set(existing) | set(new_tags))
         ref.tags = json.dumps(merged)
 
-    @staticmethod
-    def _make_slug(authors: list[dict], year: int | None, title: str) -> str:
-        """Generate human-readable slug: {surname}{year}{keyword}."""
-        _STOP = {"a", "an", "the", "new", "on", "of", "in", "for", "to", "and", "with"}
-        # First author surname
-        surname = "anon"
-        if authors:
-            name = (
-                authors[0].get("name", "")
-                if isinstance(authors[0], dict)
-                else str(authors[0])
-            )
-            if name and ";" in name:
-                name = name.split(";")[0].strip()
-            surname = name.split(",")[0].strip().lower() if name else "anon"
-        surname = (
-            unicodedata.normalize("NFKD", surname).encode("ascii", "ignore").decode()
-        )
-        surname = re.sub(r"[^a-z]", "", surname)[:30] or "anon"
-        yr = str(year) if year else "0000"
-        ascii_title = (
-            unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
-        )
-        words = re.findall(r"[a-z]+", ascii_title.lower())
-        keyword = next((w for w in words if w not in _STOP), words[0] if words else "")
-        if not keyword:
-            import hashlib
-
-            keyword = (
-                hashlib.sha256(title.encode()).hexdigest()[:6]
-                if title.strip()
-                else "untitled"
-            )
-        return f"{surname}{yr}{keyword}"
+    _make_slug = staticmethod(_lit_make_slug)
 
     @staticmethod
     def _disambiguate_slug(session: Session, base_slug: str) -> str:
@@ -584,33 +541,22 @@ class Store:
                     self._config.embed_model,
                     len(blocks),
                 )
-                embedder = _get_embedder(self._config)
-                if embedder:
-                    try:
-                        blocks = _reembed_blocks(blocks, embedder)
-                        # Write embeddings back to bundle so future reingests skip this
-                        _update_bundle_embeddings(
-                            bundle_path,
-                            data,
-                            blocks,
-                            self._config.embed_model,
-                            self._config.embed_dim,
-                        )
-                    except Exception:
-                        log.warning("Re-embedding failed, skipping vector index")
-                        blocks = []  # skip indexing
-                else:
-                    log.warning(
-                        "No embedder available for '%s', skipping vector index",
-                        self._config.embed_provider,
+                try:
+                    embedder = _get_embedder(self._config)
+                    blocks = _reembed_blocks(blocks, embedder)
+                    _update_bundle_embeddings(
+                        bundle_path,
+                        data,
+                        blocks,
+                        self._config.embed_model,
+                        self._config.embed_dim,
                     )
-                    blocks = []  # skip indexing
+                except EmbedderUnavailableError as exc:
+                    raise EmbedderUnavailableError(
+                        f"Cannot re-embed bundle for vector indexing: {exc}"
+                    ) from exc
 
-            # Index embeddings in vector store (best-effort)
-            try:
-                self.index.add_blocks(str(ref_id), blocks)
-            except Exception:
-                pass
+            self.index.add_blocks(str(ref_id), blocks)
 
         return ref_id
 
@@ -1097,8 +1043,10 @@ class Store:
             session.commit()
         try:
             self.index.delete_paper(str(ref_id))
-        except Exception:
-            pass
+        except (KeyError, ValueError) as exc:
+            # Vector index may not contain this paper (indexing was skipped
+            # during ingest, or backend switched). Metadata row is still deleted.
+            log.debug("Vector index delete skipped for ref_id=%s: %s", ref_id, exc)
         return True
 
     def list_papers(
@@ -1173,11 +1121,7 @@ class Store:
             total_ingested = session.query(Paper).count()
             total_blocks = session.query(Block).count()
             verified = session.query(Paper).filter(Paper.verified.is_(True)).count()
-        indexed = 0
-        try:
-            indexed = self.index.count()
-        except Exception:
-            pass
+        indexed = self.index.count()
 
         # Connection info
         info: dict[str, Any] = {
@@ -1538,12 +1482,8 @@ class Store:
 
             session.commit()
 
-        # Index embeddings (best-effort)
         if blocks:
-            try:
-                self.index.add_blocks(str(ref_id), blocks)
-            except Exception:
-                pass
+            self.index.add_blocks(str(ref_id), blocks)
 
         return ref_id
 
@@ -1740,8 +1680,16 @@ def _update_bundle_embeddings(
     try:
         with gzip.open(bundle_path, "wt", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-    except Exception:
-        log.warning("Failed to write embeddings back to %s", bundle_path)
+    except OSError as exc:
+        # Bundle on a read-only filesystem or permission-denied is non-fatal
+        # for ingest (DB already has the blocks), but the next re-ingest will
+        # waste work re-embedding again — surface the path so the user can
+        # fix permissions.
+        log.warning(
+            "Failed to write embeddings back to %s: %s. "
+            "Check file permissions; next re-ingest will repeat the embedding work.",
+            bundle_path, exc,
+        )
 
 
 def _read_bundle(path: str | Path) -> dict[str, Any]:

@@ -78,6 +78,7 @@ class TestReembed:
         import json
         from unittest.mock import patch
 
+        dim = store._config.embed_dim
         data = {
             "header": {
                 "paper_id": "doi:10.1234/match",
@@ -101,13 +102,13 @@ class TestReembed:
                     "text": "Some text about matching embeddings.",
                     "section_path": [],
                     "bbox": None,
-                    "embeddings": {"default": [0.1] * 384},
+                    "embeddings": {"default": [0.1] * dim},
                     "summary": None,
                 }
             ],
             "enrichment_meta": {
                 "embedding_models": {
-                    "default": {"model": store._config.embed_model, "dim": 384}
+                    "default": {"model": store._config.embed_model, "dim": dim}
                 }
             },
         }
