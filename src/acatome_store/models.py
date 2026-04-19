@@ -288,10 +288,9 @@ class Ref(Base):
         Index("idx_refs_slug", "slug"),
     )
 
-    __mapper_args__ = {
-        "polymorphic_on": "corpus_id",
-        "polymorphic_identity": "papers",
-    }
+    # Note: corpus_id is a plain discriminator column, NOT polymorphic.
+    # All corpus types (papers, flashcards, todos, etc.) use the same Ref
+    # class — no subclass dispatch needed.
 
     # ── Metadata helpers ──────────────────────────────────────────────
 
@@ -337,7 +336,9 @@ class Ref(Base):
         return self._meta.get("retraction_note")
 
     def to_dict(self) -> dict[str, Any]:
-        d = {c.name: getattr(self, c.name) for c in self.__table__.columns}
+        # Use mapper attr keys — avoids clash between DB column "metadata"
+        # and SQLAlchemy's reserved DeclarativeBase.metadata attribute.
+        d = {p.key: getattr(self, p.key) for p in self.__mapper__.column_attrs}
         # Expose metadata fields at top level for backward compat
         d.update(self._meta)
         # Merge paper fields if ingested
