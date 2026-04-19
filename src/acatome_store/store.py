@@ -59,6 +59,26 @@ from acatome_store.vector import VectorIndex, create_index
 
 log = logging.getLogger(__name__)
 
+# Strict identifier validator for SQL identifiers that must be
+# string-interpolated (table names in PRAGMA/ALTER TABLE, column names
+# in ALTER TABLE).  SQLite's PRAGMA and most backends' DDL do not
+# accept bound parameters for identifiers, so we must interpolate —
+# but only whitelisted shapes.  This allows ``a-z A-Z 0-9 _`` only,
+# 1–63 chars (Postgres identifier length limit).
+_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _assert_safe_ident(name: str, *, kind: str = "identifier") -> None:
+    """Raise ``ValueError`` if ``name`` is not a safe SQL identifier.
+
+    Defends against metacharacter injection into the handful of DDL
+    statements where bound parameters are not supported.
+    """
+    if not isinstance(name, str) or not _SAFE_IDENT_RE.match(name):
+        raise ValueError(
+            f"Unsafe SQL {kind} {name!r}: must match [A-Za-z_][A-Za-z0-9_]{{0,62}}"
+        )
+
 
 def _get_embedder(
     config: StoreConfig,
@@ -170,7 +190,15 @@ class Store:
             log.debug("Skipped blocks_v view creation: %s", exc)
 
     def _ensure_missing_columns(self, is_pg: bool) -> None:
-        """Add missing columns to existing tables (Postgres and SQLite)."""
+        """Add missing columns to existing tables (Postgres and SQLite).
+
+        Identifiers are all hardcoded in the migrations list below and
+        validated against :data:`_SAFE_IDENT_RE` before being used in
+        SQL string interpolation.  ``text()`` with f-strings is a tool
+        that could become dangerous if this function ever learns to
+        read migrations from external data; the validator guards against
+        that future mistake.
+        """
         # (table, column, pg_type, sqlite_type)
         # SQLite doesn't support UNIQUE in ALTER TABLE ADD COLUMN,
         # so we add a separate CREATE UNIQUE INDEX step below.
@@ -186,6 +214,12 @@ class Store:
              "VARCHAR DEFAULT 'ingestion'", "VARCHAR DEFAULT 'ingestion'"),
             ("notes", "origin", "VARCHAR", "VARCHAR"),
         ]
+        # Validate identifiers once up-front so a typo in the migrations
+        # list (or a future data-driven call site) fails loudly instead
+        # of smuggling metacharacters into the SQL.
+        for table, column, *_ in migrations:
+            _assert_safe_ident(table, kind="table")
+            _assert_safe_ident(column, kind="column")
         try:
             from sqlalchemy import text
 
@@ -195,8 +229,10 @@ class Store:
                         row = conn.execute(
                             text(
                                 "SELECT 1 FROM information_schema.columns "
-                                f"WHERE table_name='{table}' AND column_name='{column}'"
-                            )
+                                "WHERE table_name = :table "
+                                "AND column_name = :column"
+                            ),
+                            {"table": table, "column": column},
                         ).fetchone()
                     else:
                         rows = conn.execute(
