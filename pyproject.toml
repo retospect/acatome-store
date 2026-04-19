@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "acatome-store"
-version = "0.7.5"
+version = "0.8.0"
 description = "Persistent storage, dedup, metadata queries, and semantic search for acatome bundles"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -19,6 +19,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "acatome-meta>=0.3.4",
     "sqlalchemy>=2.0",
     "llama-index-core>=0.11",
     "llama-index-vector-stores-chroma>=0.2",

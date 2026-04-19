@@ -28,6 +28,8 @@ from typing import Any
 
 from acatome_meta.literature import (
     EmbedderUnavailableError,
+)
+from acatome_meta.literature import (
     make_slug as _lit_make_slug,
 )
 from precis_summary import pick_best_summary
