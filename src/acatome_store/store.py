@@ -1113,6 +1113,34 @@ class Store:
                 )
             return result
 
+    def list_refs_by_corpus(
+        self,
+        corpus_id: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List refs filtered by corpus, ordered by first_seen_at desc.
+
+        Use for direct-write corpora (todos, wiki, notes, flashcards, etc.)
+        where the refs table is the source of truth and there is no Paper
+        row to join against.
+
+        Args:
+            corpus_id: Corpus to filter by (e.g. ``"todos"``, ``"flashcards"``).
+            limit: Max refs to return.
+            offset: Pagination offset.
+        """
+        with self._Session() as session:
+            stmt = (
+                select(Ref)
+                .where(Ref.corpus_id == corpus_id)
+                .order_by(Ref.first_seen_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [r.to_dict() for r in rows]
+
     def stats(self) -> dict[str, Any]:
         """Return store statistics and connection info."""
         cfg = self._config
