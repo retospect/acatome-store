@@ -19,19 +19,15 @@ Identity model:
 
 from __future__ import annotations
 
-import gzip
 import json
 import logging
 import re
-from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from acatome_meta.literature import (
-    SKIP_EMBED_TYPES,
     EmbedderUnavailableError,
-    build_embedder,
     make_slug as _lit_make_slug,
 )
 from precis_summary import pick_best_summary
@@ -40,6 +36,23 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
+# Pure-function helpers live in _helpers.py; re-exported here under
+# their original private names for backward compatibility.
+from acatome_store._helpers import (
+    assert_safe_ident as _assert_safe_ident,
+)
+from acatome_store._helpers import (
+    get_embedder as _get_embedder,
+)
+from acatome_store._helpers import (
+    read_bundle as _read_bundle,
+)
+from acatome_store._helpers import (
+    reembed_blocks as _reembed_blocks,
+)
+from acatome_store._helpers import (
+    update_bundle_embeddings as _update_bundle_embeddings,
+)
 from acatome_store.config import StoreConfig
 from acatome_store.models import (
     Base,
@@ -58,73 +71,6 @@ from acatome_store.models import (
 from acatome_store.vector import VectorIndex, create_index
 
 log = logging.getLogger(__name__)
-
-# Strict identifier validator for SQL identifiers that must be
-# string-interpolated (table names in PRAGMA/ALTER TABLE, column names
-# in ALTER TABLE).  SQLite's PRAGMA and most backends' DDL do not
-# accept bound parameters for identifiers, so we must interpolate —
-# but only whitelisted shapes.  This allows ``a-z A-Z 0-9 _`` only,
-# 1–63 chars (Postgres identifier length limit).
-_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
-
-
-def _assert_safe_ident(name: str, *, kind: str = "identifier") -> None:
-    """Raise ``ValueError`` if ``name`` is not a safe SQL identifier.
-
-    Defends against metacharacter injection into the handful of DDL
-    statements where bound parameters are not supported.
-    """
-    if not isinstance(name, str) or not _SAFE_IDENT_RE.match(name):
-        raise ValueError(
-            f"Unsafe SQL {kind} {name!r}: must match [A-Za-z_][A-Za-z0-9_]{{0,62}}"
-        )
-
-
-def _get_embedder(
-    config: StoreConfig,
-) -> Callable[[list[str]], list[list[float]]]:
-    """Build an embedding function from the store's configured profile.
-
-    Raises:
-        EmbedderUnavailableError: if the configured backend is not installed;
-            message includes the ``pip install`` incantation.
-        ValueError: if ``config.embed_provider`` is not recognised.
-    """
-    return build_embedder(
-        provider=config.embed_provider,
-        model=config.embed_model,
-        dim=config.embed_dim,
-        index_dim=config.embed_index_dim,
-    )
-
-
-def _reembed_blocks(
-    blocks: list[dict[str, Any]],
-    embedder: Callable[[list[str]], list[list[float]]],
-    profile: str = "default",
-) -> list[dict[str, Any]]:
-    """Re-embed blocks using the given embedder, replacing existing embeddings."""
-    texts = []
-    indices = []
-    for i, b in enumerate(blocks):
-        if b.get("type") in SKIP_EMBED_TYPES:
-            continue
-        text = b.get("text", "").strip()
-        if not text:
-            continue
-        texts.append(text)
-        indices.append(i)
-
-    if not texts:
-        return blocks
-
-    embeddings = embedder(texts)
-    for idx, emb in zip(indices, embeddings):
-        if "embeddings" not in blocks[idx]:
-            blocks[idx]["embeddings"] = {}
-        blocks[idx]["embeddings"][profile] = emb
-
-    return blocks
 
 
 class Store:
@@ -1718,46 +1664,3 @@ class Store:
         """Dispose of the engine."""
         if hasattr(self, "_engine"):
             self._engine.dispose()
-
-
-def _update_bundle_embeddings(
-    bundle_path: Path,
-    data: dict[str, Any],
-    blocks: list[dict[str, Any]],
-    embed_model: str,
-    embed_dim: int,
-) -> None:
-    """Write re-embedded blocks back into the .acatome bundle.
-
-    Updates the blocks' embeddings and enrichment_meta so future
-    reingests don't need to re-embed.
-    """
-    data["blocks"] = blocks
-    em = data.get("enrichment_meta") or {}
-    models = em.get("embedding_models") or {}
-    models["default"] = {"model": embed_model, "dim": embed_dim}
-    em["embedding_models"] = models
-    em.setdefault("profiles", [])
-    if "default" not in em["profiles"]:
-        em["profiles"].append("default")
-    data["enrichment_meta"] = em
-    try:
-        with gzip.open(bundle_path, "wt", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-    except OSError as exc:
-        # Bundle on a read-only filesystem or permission-denied is non-fatal
-        # for ingest (DB already has the blocks), but the next re-ingest will
-        # waste work re-embedding again — surface the path so the user can
-        # fix permissions.
-        log.warning(
-            "Failed to write embeddings back to %s: %s. "
-            "Check file permissions; next re-ingest will repeat the embedding work.",
-            bundle_path, exc,
-        )
-
-
-def _read_bundle(path: str | Path) -> dict[str, Any]:
-    """Read a .acatome bundle (gzipped JSON)."""
-    path = Path(path)
-    with gzip.open(path, "rt", encoding="utf-8") as f:
-        return json.load(f)
