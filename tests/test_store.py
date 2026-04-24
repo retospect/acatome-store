@@ -238,6 +238,43 @@ class TestRefreshOnReingest:
             assert ref.year == 2024
             assert ref.slug == "real2024paper"
 
+    def test_clean_title_not_downgraded_by_verified_garbage(self, store, tmp_path):
+        """Safety: a verified bundle with a garbage title must not overwrite a clean title."""
+        clean_unverified = self._write_bundle(
+            tmp_path,
+            "clean_unverified",
+            {
+                "slug": "geim2007rise",
+                "title": "The rise of graphene",
+                "year": 2007,
+                "pdf_hash": "d4" * 32,
+                "verified": False,
+            },
+        )
+        verified_garbage = self._write_bundle(
+            tmp_path,
+            "verified_garbage",
+            {
+                "slug": "bad",
+                "title": "nmat1849 Geim Progress Article.indd",
+                "doi": "10.1038/nmat1849",
+                "pdf_hash": "d4" * 32,  # same PDF
+                "verified": True,
+            },
+        )
+
+        ref_id = store.ingest(clean_unverified)
+        store.ingest(verified_garbage)
+
+        with store._Session() as session:
+            ref = session.get(Ref, ref_id)
+            # Clean title preserved…
+            assert ref.title == "The rise of graphene"
+            # …but the DOI from the verified bundle still filled in
+            assert ref.doi == "10.1038/nmat1849"
+            # …and Paper.verified upgraded to True
+            assert ref.paper.verified is True
+
     def test_slug_upgrade_skipped_on_collision(self, store, tmp_path):
         """Upgrade must not overwrite slug if the new slug collides with another Ref."""
         # Seed another Ref with the target slug

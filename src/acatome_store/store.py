@@ -372,11 +372,18 @@ class Store:
         self,
         ref_id: int,
         block_specs: list[tuple[str, str, str]],
+        corpus_id: str | None = None,
     ) -> int:
         """Compute + push embeddings for direct-write blocks (best-effort).
 
         Wraps :meth:`_compute_block_embeddings` + :meth:`VectorIndex.add_blocks`
         in try/except so indexing failures never propagate out of a write.
+
+        ``corpus_id`` is forwarded to the vector index so per-block
+        metadata (used for cross-corpus filters on Chroma) is stamped
+        at index time.  The pgvector backend ignores the kwarg — it
+        already joins ``blocks`` → ``refs`` at query time for the
+        corpus filter.
 
         Returns the number of blocks successfully indexed (0 on any failure).
         """
@@ -384,7 +391,7 @@ class Store:
         if not embedded:
             return 0
         try:
-            return self.index.add_blocks(str(ref_id), embedded)
+            return self.index.add_blocks(str(ref_id), embedded, corpus_id=corpus_id)
         except Exception as exc:  # pragma: no cover — best-effort
             log.warning(
                 "Failed to index %d direct-write embedding(s) for ref %s: %s",
@@ -475,7 +482,17 @@ class Store:
             if not new_val:
                 continue
             cur_val = getattr(ref, field, None)
-            if not cur_val or upgrade:
+            if not cur_val:
+                setattr(ref, field, new_val)
+            elif upgrade:
+                # Title-specific guard: don't downgrade a clean title to
+                # garbage just because the new bundle happens to be verified.
+                if (
+                    field == "title"
+                    and _is_garbage_title(new_val)
+                    and not _is_garbage_title(cur_val)
+                ):
+                    continue
                 setattr(ref, field, new_val)
 
         # authors (stored as JSON array)
@@ -763,7 +780,7 @@ class Store:
                         f"Cannot re-embed bundle for vector indexing: {exc}"
                     ) from exc
 
-            self.index.add_blocks(str(ref_id), blocks)
+            self.index.add_blocks(str(ref_id), blocks, corpus_id="papers")
 
         return ref_id
 
@@ -863,7 +880,7 @@ class Store:
         # participate in cross-corpus search immediately.  Failures
         # here are logged but do not propagate: the ref already exists.
         if block_specs:
-            self._index_direct_blocks(ref_id, block_specs)
+            self._index_direct_blocks(ref_id, block_specs, corpus_id=corpus_id)
         return ref_id
 
     def update_ref_metadata(
@@ -910,12 +927,40 @@ class Store:
         query: str,
         top_k: int = 5,
         where: dict[str, Any] | None = None,
+        corpora: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Semantic text search via vector index.
 
-        Returns list of result dicts with text, metadata, distance,
-        and enriched paper info.
+        Args:
+            query: Natural-language query to embed and rank against.
+            top_k: Max number of hits to return.
+            where: Chroma-style filter dict forwarded to the vector
+                index.  See :meth:`VectorIndex.search_text` for the
+                supported keys (``paper_id``, ``profile``,
+                ``block_type``, ``corpus_id``).  Scalar or
+                ``{'$in': [...]}``.
+            corpora: Convenience kwarg for cross-corpus search —
+                pass a list of corpus ids (``['papers', 'memories',
+                'websites']``) and the call is dispatched with
+                ``where={'corpus_id': {'$in': corpora}}``.  When set
+                alongside ``where``, the corpus filter is merged into
+                ``where``; explicit ``where['corpus_id']`` wins.
+
+        Returns:
+            list of result dicts with ``text``, ``metadata`` (now
+            always including ``corpus_id`` + ``slug`` + ``ref_title``
+            via the Block→Ref JOIN), ``distance``, and enriched
+            ``paper`` info for papers.
         """
+        # Merge ``corpora`` into ``where`` unless the caller already
+        # pinned ``corpus_id`` explicitly.
+        if corpora:
+            where = dict(where) if where else {}
+            if "corpus_id" not in where:
+                where["corpus_id"] = (
+                    corpora[0] if len(corpora) == 1 else {"$in": list(corpora)}
+                )
+
         hits = self.index.search_text(query, top_k=top_k, where=where)
 
         for hit in hits:
@@ -1082,7 +1127,10 @@ class Store:
             session.commit()
 
         # Refresh embedding for the changed text.
-        self._index_direct_blocks(ref_id, [(node_id, text, block_type)])
+        corpus_id = paper.get("corpus_id") if paper else None
+        self._index_direct_blocks(
+            ref_id, [(node_id, text, block_type)], corpus_id=corpus_id
+        )
 
     def add_block(
         self,
@@ -1183,7 +1231,10 @@ class Store:
             session.commit()
 
         # Embed the new block (best-effort).
-        self._index_direct_blocks(ref_id, [(chosen_node_id, text, block_type)])
+        corpus_id = ref.get("corpus_id") if ref else None
+        self._index_direct_blocks(
+            ref_id, [(chosen_node_id, text, block_type)], corpus_id=corpus_id
+        )
         return chosen_node_id
 
     # ------------------------------------------------------------------
@@ -1992,7 +2043,7 @@ class Store:
             session.commit()
 
         if blocks:
-            self.index.add_blocks(str(ref_id), blocks)
+            self.index.add_blocks(str(ref_id), blocks, corpus_id="papers")
 
         return ref_id
 
