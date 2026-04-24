@@ -268,22 +268,12 @@ class TestAddBlock:
 
 
 # ---------------------------------------------------------------------------
-# backfill_embeddings — legacy migration pass (postgres only)
+# backfill_embeddings — legacy migration pass for pre-embed-on-write rows
 # ---------------------------------------------------------------------------
 
 
 class TestBackfillEmbeddings:
-    def test_sqlite_raises_not_implemented(self, store, fake_embedder):
-        if store._config.vector_backend == "postgres":
-            pytest.skip("postgres-specific negative check")
-        with pytest.raises(NotImplementedError):
-            store.backfill_embeddings()
-
-    @pytest.mark.postgres
     def test_backfill_populates_null_rows(self, store, fake_embedder):
-        if store._config.vector_backend != "postgres":
-            pytest.skip("postgres-only feature")
-
         # Create a ref with an embedder — rows get embedded immediately.
         store.create_ref(
             slug="already-embedded",
@@ -312,11 +302,7 @@ class TestBackfillEmbeddings:
         assert result["failed"] == 0
         assert fake_embedder.total_texts >= 1
 
-    @pytest.mark.postgres
     def test_backfill_dry_run(self, store, fake_embedder):
-        if store._config.vector_backend != "postgres":
-            pytest.skip("postgres-only feature")
-
         store.create_ref(
             slug="dry-run-ref",
             corpus_id="notes",
@@ -336,11 +322,7 @@ class TestBackfillEmbeddings:
         assert result["embedded"] == 0
         assert result["scanned"] >= 1
 
-    @pytest.mark.postgres
     def test_backfill_corpus_scope(self, store, fake_embedder):
-        if store._config.vector_backend != "postgres":
-            pytest.skip("postgres-only feature")
-
         store.create_ref(
             slug="todo-scoped-1",
             corpus_id="todos",

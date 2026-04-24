@@ -1,20 +1,22 @@
-"""Tests for cross-corpus semantic search.
+"""Tests for cross-corpus semantic search (pgvector, v1.0.0+).
 
-The store now supports filtering :meth:`Store.search_text` by one or
-more corpora, either via an explicit ``where={'corpus_id': ...}`` dict
-or the ``corpora=[...]`` convenience kwarg.  On Postgres the filter is
-a JOIN to ``refs`` at query time; on Chroma it's a metadata filter
-stamped at ``add_blocks`` time.
+The store supports filtering :meth:`Store.search_text` by one or
+more corpora, either via an explicit ``where={'corpus_id': ...}``
+dict or the ``corpora=[...]`` convenience kwarg.  The filter is a
+JOIN to ``refs`` at query time.
 
-Three test layers:
+Two test layers:
 
 1. **Plumbing** — unit tests that a mocked vector index receives the
-   right ``where`` dict for each caller shape.  Fast, backend-agnostic.
-2. **Chroma integration** — round-trip over the real Chroma backend
-   (slow-ish: downloads all-MiniLM-L6-v2 weights once via Chroma's
-   built-in embedder).
-3. **pgvector integration** — round-trip over Postgres+pgvector (only
-   runs when a test DB is configured via ``PG_TEST_*`` env vars).
+   right ``where`` dict for each caller shape.  Fast.
+2. **pgvector integration** — round-trip over Postgres+pgvector
+   through the ``store`` fixture.
+
+Chroma is gone (v1.0.0 removed both Chroma and the SQLite fallback),
+so the old Layer-2 Chroma-metadata tests have been deleted; the
+sqlite-skip branches in Layer-3 are likewise dead and are now
+plain integration tests that assume a live Postgres (the ``store``
+fixture skips the whole test module if no test DB is configured).
 """
 
 from __future__ import annotations
@@ -137,87 +139,20 @@ class TestStoreSearchCorporaPlumbing:
 
 
 # ===========================================================================
-# Layer 2 — Chroma integration: corpus_id stamped on metadata
+# Layer 2 — pgvector integration: JOIN produces corpus_id + slug + ref_title,
+# and the ``corpora=`` filter is a real SQL IN clause.
 # ===========================================================================
 
 
-class TestChromaCorpusMetadata:
-    """End-to-end: ``create_ref(corpus_id='memories', blocks=[...])``
-    should stamp ``corpus_id`` onto the Chroma metadata so the filter
-    actually works at query time.
-    """
-
-    def test_add_blocks_stamps_corpus_id(self, tmp_path):
-        """ChromaIndex.add_blocks puts corpus_id into per-node metadata
-        when called with the kwarg."""
-        from acatome_store.config import StoreConfig
-        from acatome_store.vector import create_index
-
-        config = StoreConfig(store_path=tmp_path, vector_backend="chroma")
-        index = create_index(config, collection_name="corpus_meta_test")
-
-        blocks = [
-            {
-                "node_id": "m1-p00-000",
-                "page": 0,
-                "type": "text",
-                "text": "first memory",
-                "section_path": [],
-                "embeddings": {"default": [0.1] * 384},
-            }
-        ]
-        n = index.add_blocks("1", blocks, corpus_id="memories")
-        assert n == 1
-
-        # Pull the raw record back — Chroma exposes metadata via .get().
-        got = index._collection.get(ids=["m1-p00-000:default"])
-        meta = got["metadatas"][0]
-        assert meta["corpus_id"] == "memories"
-        assert meta["paper_id"] == "1"  # legacy key still present
-
-    def test_add_blocks_no_corpus_id_omits_key(self, tmp_path):
-        """Old-style callers (no corpus_id kwarg) get valid index
-        entries without the ``corpus_id`` metadata key — filters on
-        ``corpus_id`` won't match them, which is the intended
-        backward-compat behaviour."""
-        from acatome_store.config import StoreConfig
-        from acatome_store.vector import create_index
-
-        config = StoreConfig(store_path=tmp_path, vector_backend="chroma")
-        index = create_index(config, collection_name="no_corpus_test")
-
-        blocks = [
-            {
-                "node_id": "x-p00-000",
-                "page": 0,
-                "type": "text",
-                "text": "x",
-                "section_path": [],
-                "embeddings": {"default": [0.1] * 384},
-            }
-        ]
-        index.add_blocks("1", blocks)
-        got = index._collection.get(ids=["x-p00-000:default"])
-        meta = got["metadatas"][0]
-        assert "corpus_id" not in meta
-
-
-# ===========================================================================
-# Layer 3 — pgvector-only: JOIN produces corpus_id + slug + ref_title
-#
-# Chroma is excluded from these integration tests because its built-in
-# query embedder ships as all-MiniLM-L6-v2 (384-dim) and mismatches the
-# store's configured ``embed_dim`` (1024 for BAAI/bge-m3).  That's a
-# pre-existing tension in the Chroma path, unrelated to cross-corpus
-# search — the Chroma metadata stamp is covered by Layer 2 already.
-# ===========================================================================
-
-
-@pytest.mark.postgres
 class TestPgVectorJoinMetadata:
-    """pgvector-specific: the JOIN to Ref must hydrate corpus_id + slug
-    + ref_title on every hit, and the ``corpora=`` filter must be a
-    real SQL IN clause (not a client-side post-filter)."""
+    """The JOIN to Ref must hydrate corpus_id + slug + ref_title on
+    every hit, and the ``corpora=`` filter must be a real SQL IN
+    clause (not a client-side post-filter).
+
+    These tests rely on the ``store`` fixture which skips the whole
+    module if no test Postgres is configured — so no per-test skip
+    branch is needed.
+    """
 
     def _install_fake_query_embedder(self, store):
         """Replace the query-time SentenceTransformer with a fake so
@@ -236,9 +171,6 @@ class TestPgVectorJoinMetadata:
         store.index._st_model = _FakeModel()
 
     def test_join_returns_corpus_id_slug_title(self, store, fake_embedder):
-        if store._config.vector_backend != "postgres":
-            pytest.skip("pgvector-specific JOIN assertion")
-
         store.create_ref(
             slug="note-beta",
             corpus_id="notes",
@@ -255,9 +187,6 @@ class TestPgVectorJoinMetadata:
         assert meta["ref_title"] == "Note beta title"
 
     def test_join_corpus_id_in_filter(self, store, fake_embedder):
-        if store._config.vector_backend != "postgres":
-            pytest.skip("pgvector-specific filter assertion")
-
         store.create_ref(
             slug="n-1",
             corpus_id="notes",
@@ -289,9 +218,6 @@ class TestPgVectorJoinMetadata:
 
     def test_scalar_corpus_id_filter(self, store, fake_embedder):
         """Scalar corpus_id in where dict (not a list) is an equality."""
-        if store._config.vector_backend != "postgres":
-            pytest.skip("pgvector-specific filter assertion")
-
         store.create_ref(
             slug="mem-single",
             corpus_id="memories",

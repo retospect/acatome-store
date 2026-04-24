@@ -1,13 +1,17 @@
 """Shared fixtures for acatome-store tests.
 
-The ``store`` fixture is parametrized so every test runs on **both**
-backends automatically:
+v1.0.0+ is Postgres-only.  All tests run against a live Postgres with
+pgvector via the ``store`` fixture — SQLite/Chroma fallback is gone.
 
-  - **sqlite** — SQLite + Chroma (always runs)
-  - **postgres** — Postgres + pgvector (``-m postgres``, needs live DB)
+Env vars for connecting to the test Postgres instance:
+  PG_TEST_HOST      (default: localhost)
+  PG_TEST_PORT      (default: 5432)
+  PG_TEST_DB        (default: acatome_test)
+  PG_TEST_USER      (default: acatome)
+  PG_TEST_PASSWORD  (default: acatome)
 
-Env vars for Postgres tests:
-  PG_TEST_HOST, PG_TEST_PORT, PG_TEST_DB, PG_TEST_USER, PG_TEST_PASSWORD
+If the test Postgres is unreachable, every test using ``store`` is
+skipped with a clear reason — but CI should always have one running.
 """
 
 from __future__ import annotations
@@ -57,43 +61,38 @@ def _check_postgres() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Parametrized store fixture
+# Store fixture (Postgres-only)
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(
-    params=[
-        "sqlite",
-        pytest.param("postgres", marks=pytest.mark.postgres),
-    ]
-)
-def store(request, tmp_path):
-    """Fresh store — runs every test on both backends."""
-    backend = request.param
+@pytest.fixture
+def store(tmp_path):
+    """Fresh store against a dedicated Postgres test DB.
 
-    if backend == "postgres":
-        if not _check_postgres():
-            pytest.skip("Postgres not available")
-        cfg = StoreConfig(
-            store_path=tmp_path / "store",
-            metadata_backend="postgres",
-            vector_backend="postgres",
-            _db_url=_pg_url,
+    Each test gets a fresh schema: the fixture drops the ``blocks_v``
+    view (if present) and ``Base.metadata.drop_all`` at teardown so
+    the next test starts from a clean DDL + seed state.
+    """
+    if not _check_postgres():
+        pytest.skip(
+            "Postgres test DB unreachable — set PG_TEST_* env vars or "
+            "run 'createdb acatome_test && psql -c \"CREATE EXTENSION vector\" acatome_test'"
         )
-    else:
-        cfg = StoreConfig(store_path=tmp_path / "store")
 
+    cfg = StoreConfig(
+        store_path=tmp_path / "store",
+        _db_url=_pg_url,
+    )
     s = Store(config=cfg)
-    yield s
-
-    # Teardown: clean state for Postgres
-    if backend == "postgres":
+    try:
+        yield s
+    finally:
         from sqlalchemy import text
 
         with s._engine.begin() as conn:
             conn.execute(text("DROP VIEW IF EXISTS blocks_v CASCADE"))
         Base.metadata.drop_all(s._engine)
-    s.close()
+        s._engine.dispose()
 
 
 # ---------------------------------------------------------------------------

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
 
 from acatome_store.config import StoreConfig
@@ -806,54 +804,12 @@ class TestRetractions:
         assert store.unretract("nonexistent") is False
 
 
-class TestSQLiteMigration:
-    """Regression: Store must auto-migrate legacy SQLite without corpus_id."""
-
-    def test_legacy_refs_gets_corpus_id(self, tmp_path):
-        """Create a v2-era SQLite DB (no corpus_id on refs), then open
-        Store which should add the missing column automatically."""
-        db_path = tmp_path / "store" / "acatome.db"
-        db_path.parent.mkdir(parents=True)
-
-        # Create a minimal legacy schema — refs without corpus_id/slug/metadata
-        con = sqlite3.connect(str(db_path))
-        con.execute(
-            "CREATE TABLE refs ("
-            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            "  doi TEXT UNIQUE,"
-            "  s2_id TEXT UNIQUE,"
-            "  arxiv_id TEXT UNIQUE,"
-            "  title TEXT,"
-            "  authors TEXT,"
-            "  year INTEGER,"
-            "  keywords TEXT,"
-            "  first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-            ")"
-        )
-        con.execute(
-            "INSERT INTO refs (doi, title, year) "
-            "VALUES ('10.1234/test', 'Legacy paper', 2023)"
-        )
-        con.commit()
-        con.close()
-
-        # Open Store — should auto-migrate without error
-        cfg = StoreConfig(store_path=tmp_path / "store")
-        s = Store(config=cfg)
-
-        # Verify the column exists and has the default value
-        with s._Session() as session:
-            from sqlalchemy import text
-
-            row = session.execute(
-                text("SELECT corpus_id FROM refs WHERE doi = '10.1234/test'")
-            ).fetchone()
-            assert row is not None
-            assert row[0] == "papers"
-
-        # Verify ORM query doesn't crash on corpus_id
-        result = s.get("10.1234/test")
-        assert result is not None
-        assert result["title"] == "Legacy paper"
-
-        s.close()
+# ---------------------------------------------------------------------------
+# SQLite legacy-migration tests removed in v1.0.0.
+#
+# The old ``TestSQLiteMigration`` class simulated a pre-0.6 SQLite DB
+# and asserted Store would auto-add the missing ``corpus_id`` column.
+# Since v1.0.0 the store is Postgres-only and refuses to open a SQLite
+# URL — the legacy migration path is unreachable code and its test
+# was removed.  See the v0.9→1.0 migration note in CHANGELOG.md.
+# ---------------------------------------------------------------------------

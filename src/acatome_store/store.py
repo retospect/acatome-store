@@ -1,9 +1,9 @@
 """Core Store class: ingest, search, metadata queries.
 
 Persistence:
-  - Relational data (corpora, refs, papers, blocks, links) via SQLAlchemy
-    ORM (portable across SQLite, Postgres, MySQL via connection string)
-  - Vector search via Chroma (LlamaIndex) or pgvector (SQLAlchemy column)
+  - Relational data (corpora, refs, papers, blocks, links) via
+    SQLAlchemy ORM on Postgres.
+  - Vector search via pgvector (SQLAlchemy column on blocks.embedding).
 
 Identity model:
   - ``Corpus`` = document type registry with write policy.
@@ -83,11 +83,10 @@ _MISSING: Any = object()
 
 
 class Store:
-    """Acatome paper store.
+    """Acatome paper store — Postgres + pgvector only (v1.0.0+).
 
     - SQLAlchemy ORM for relational CRUD (refs, papers, blocks, citations)
-    - LlamaIndex ChromaVectorStore for Chroma vector search
-    - pgvector column on blocks table for Postgres vector search
+    - pgvector column on blocks.embedding for ANN search
     """
 
     def __init__(self, config: StoreConfig | None = None):
@@ -100,37 +99,36 @@ class Store:
         self._config.store_path.mkdir(parents=True, exist_ok=True)
 
     def _init_db(self) -> None:
-        """Create SQLAlchemy engine, session factory, and tables."""
+        """Create SQLAlchemy engine, session factory, and tables.
+
+        v1.0.0+ is Postgres-only.  ``StoreConfig.db_url`` always
+        produces a ``postgresql+psycopg://…`` URL; a non-Postgres URL
+        is a misconfiguration and we fail loudly at construction
+        rather than silently degrading.
+        """
         url = self._config.db_url
-        is_pg = url.startswith("postgresql")
+        if not url.startswith("postgresql"):
+            raise RuntimeError(
+                f"acatome-store requires Postgres (got db_url={url!r}). "
+                "Configure pg_host/pg_user/pg_password in your acatome "
+                "config, or pass StoreConfig(_db_url='postgresql+psycopg://…'). "
+                "The SQLite + Chroma fallback was removed in v1.0.0; see "
+                "CHANGELOG.md for the migration one-liner."
+            )
 
-        if is_pg:
-            try:
-                from acatome_store.models import add_pgvector_column
+        # Provision pgvector column on the Block model before create_all
+        # so Base.metadata.create_all below emits the vector column too.
+        from acatome_store.models import add_pgvector_column
 
-                add_pgvector_column(self._config.embed_dim)
-            except ImportError:
-                pass
+        add_pgvector_column(self._config.embed_dim)
 
         self._engine = create_engine(url)
-
-        # SQLite needs this for ON DELETE CASCADE to work
-        if url.startswith("sqlite"):
-            from sqlalchemy import event
-
-            @event.listens_for(self._engine, "connect")
-            def _set_sqlite_pragma(dbapi_conn, connection_record):
-                cursor = dbapi_conn.cursor()
-                cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.close()
-
         Base.metadata.create_all(self._engine)
         self._Session = sessionmaker(bind=self._engine)
 
         # Auto-migrate: add missing columns for existing databases
-        if is_pg:
-            self._ensure_embedding_column()
-        self._ensure_missing_columns(is_pg)
+        self._ensure_embedding_column()
+        self._ensure_missing_columns()
 
         # Seed lookup tables and create convenience view
         with self._Session() as session:
@@ -140,12 +138,13 @@ class Store:
         try:
             create_blocks_view(self._engine)
         except (OperationalError, ProgrammingError) as exc:
-            # SQLite pre-3.44 lacks CREATE OR REPLACE VIEW; the view is a
-            # convenience for human SQL queries and not required for runtime.
+            # The view is a convenience for human SQL queries and not
+            # required for runtime.  Log-and-continue: a missing view
+            # never blocks a query.
             log.debug("Skipped blocks_v view creation: %s", exc)
 
-    def _ensure_missing_columns(self, is_pg: bool) -> None:
-        """Add missing columns to existing tables (Postgres and SQLite).
+    def _ensure_missing_columns(self) -> None:
+        """Add missing columns to existing tables (Postgres).
 
         Identifiers are all hardcoded in the migrations list below and
         validated against :data:`_SAFE_IDENT_RE` before being used in
@@ -154,27 +153,19 @@ class Store:
         read migrations from external data; the validator guards against
         that future mistake.
         """
-        # (table, column, pg_type, sqlite_type)
-        # SQLite doesn't support UNIQUE in ALTER TABLE ADD COLUMN,
-        # so we add a separate CREATE UNIQUE INDEX step below.
+        # (table, column, pg_type)
         migrations = [
-            ("refs", "tags", "TEXT", "TEXT"),
+            ("refs", "tags", "TEXT"),
             (
                 "refs",
                 "corpus_id",
                 "VARCHAR DEFAULT 'papers' REFERENCES corpora(id)",
-                "VARCHAR DEFAULT 'papers'",
             ),
-            ("refs", "slug", "VARCHAR UNIQUE", "VARCHAR"),
-            ("refs", "published_date", "DATE", "DATE"),
-            ("refs", "metadata", "TEXT", "TEXT"),
-            (
-                "corpora",
-                "write_policy",
-                "VARCHAR DEFAULT 'ingestion'",
-                "VARCHAR DEFAULT 'ingestion'",
-            ),
-            ("notes", "origin", "VARCHAR", "VARCHAR"),
+            ("refs", "slug", "VARCHAR UNIQUE"),
+            ("refs", "published_date", "DATE"),
+            ("refs", "metadata", "TEXT"),
+            ("corpora", "write_policy", "VARCHAR DEFAULT 'ingestion'"),
+            ("notes", "origin", "VARCHAR"),
         ]
         # Validate identifiers once up-front so a typo in the migrations
         # list (or a future data-driven call site) fails loudly instead
@@ -186,39 +177,19 @@ class Store:
             from sqlalchemy import text
 
             with self._engine.connect() as conn:
-                for table, column, pg_type, sqlite_type in migrations:
-                    if is_pg:
-                        row = conn.execute(
-                            text(
-                                "SELECT 1 FROM information_schema.columns "
-                                "WHERE table_name = :table "
-                                "AND column_name = :column"
-                            ),
-                            {"table": table, "column": column},
-                        ).fetchone()
-                    else:
-                        rows = conn.execute(
-                            text(f"PRAGMA table_info('{table}')")
-                        ).fetchall()
-                        if not rows:
-                            continue  # table doesn't exist, skip
-                        row = any(r[1] == column for r in rows)
+                for table, column, pg_type in migrations:
+                    row = conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.columns "
+                            "WHERE table_name = :table "
+                            "AND column_name = :column"
+                        ),
+                        {"table": table, "column": column},
+                    ).fetchone()
                     if not row:
-                        col_type = pg_type if is_pg else sqlite_type
                         conn.execute(
-                            text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                            text(f"ALTER TABLE {table} ADD COLUMN {column} {pg_type}")
                         )
-                # SQLite: add unique index for slug (replaces inline UNIQUE)
-                if not is_pg:
-                    try:
-                        conn.execute(
-                            text(
-                                "CREATE UNIQUE INDEX IF NOT EXISTS "
-                                "idx_refs_slug_unique ON refs(slug)"
-                            )
-                        )
-                    except OperationalError as exc:
-                        log.debug("Slug index already present: %s", exc)
                 conn.commit()
         except (OperationalError, ProgrammingError) as exc:
             # Column already present or table missing — auto-migration is
@@ -227,60 +198,64 @@ class Store:
             log.debug("Schema auto-migration skipped: %s", exc)
 
     def _ensure_embedding_column(self) -> None:
-        """Add embedding column and HNSW index to blocks table if missing (Postgres only)."""
-        try:
-            from sqlalchemy import text
+        """Add embedding column and HNSW index to blocks table if missing.
 
-            with self._engine.connect() as conn:
+        Creates the ``vector`` extension first (requires superuser or a
+        prior ``CREATE EXTENSION`` by the DBA).  Raises if the extension
+        can't be created — pgvector is mandatory since v1.0.0.
+        """
+        from sqlalchemy import text
+
+        with self._engine.connect() as conn:
+            try:
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                row = conn.execute(
+            except (OperationalError, ProgrammingError) as exc:
+                raise RuntimeError(
+                    "pgvector extension is required but could not be created. "
+                    "Ask the DBA to run 'CREATE EXTENSION vector;' on the "
+                    f"target database, or install pgvector. Underlying error: {exc}"
+                ) from exc
+            row = conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name='blocks' AND column_name='embedding'"
+                )
+            ).fetchone()
+            if not row:
+                conn.execute(
                     text(
-                        "SELECT 1 FROM information_schema.columns "
-                        "WHERE table_name='blocks' AND column_name='embedding'"
+                        f"ALTER TABLE blocks ADD COLUMN embedding "
+                        f"vector({self._config.embed_dim})"
                     )
-                ).fetchone()
-                if not row:
-                    conn.execute(
-                        text("ALTER TABLE blocks ADD COLUMN embedding vector(384)")
-                    )
-                # Ensure HNSW index exists for ANN search (without it,
-                # every vector query does a sequential scan).
-                hnsw = conn.execute(
+                )
+            # Ensure HNSW index exists for ANN search (without it,
+            # every vector query does a sequential scan).
+            hnsw = conn.execute(
+                text(
+                    "SELECT 1 FROM pg_indexes "
+                    "WHERE tablename = 'blocks' "
+                    "AND indexdef LIKE '%hnsw%'"
+                )
+            ).fetchone()
+            if not hnsw:
+                log.info(
+                    "Creating HNSW index on blocks.embedding — "
+                    "this may take a few minutes on large tables"
+                )
+                conn.execute(
                     text(
-                        "SELECT 1 FROM pg_indexes "
-                        "WHERE tablename = 'blocks' "
-                        "AND indexdef LIKE '%hnsw%'"
+                        "CREATE INDEX idx_blocks_embedding_hnsw "
+                        "ON blocks USING hnsw (embedding vector_cosine_ops) "
+                        "WITH (m = 16, ef_construction = 64)"
                     )
-                ).fetchone()
-                if not hnsw:
-                    log.info(
-                        "Creating HNSW index on blocks.embedding — "
-                        "this may take a few minutes on large tables"
-                    )
-                    conn.execute(
-                        text(
-                            "CREATE INDEX idx_blocks_embedding_hnsw "
-                            "ON blocks USING hnsw (embedding vector_cosine_ops) "
-                            "WITH (m = 16, ef_construction = 64)"
-                        )
-                    )
-                conn.commit()
-        except (OperationalError, ProgrammingError) as exc:
-            # pgvector extension unavailable on this server; vector search
-            # will fall back to a non-pg backend or fail explicitly when used.
-            log.warning(
-                "Could not provision pgvector embedding column: %s. "
-                "Install the pgvector extension on the Postgres server, or "
-                "set vector_backend='chroma' in acatome config.",
-                exc,
-            )
+                )
+            conn.commit()
 
     @property
     def index(self) -> VectorIndex:
-        """Lazy-init vector index."""
+        """Lazy-init pgvector index."""
         if self._index is None:
-            sf = self._Session if self._config.vector_backend == "postgres" else None
-            self._index = create_index(self._config, session_factory=sf)
+            self._index = create_index(self._config, session_factory=self._Session)
         return self._index
 
     # ------------------------------------------------------------------
@@ -379,10 +354,9 @@ class Store:
         Wraps :meth:`_compute_block_embeddings` + :meth:`VectorIndex.add_blocks`
         in try/except so indexing failures never propagate out of a write.
 
-        ``corpus_id`` is forwarded to the vector index so per-block
-        metadata (used for cross-corpus filters on Chroma) is stamped
-        at index time.  The pgvector backend ignores the kwarg — it
-        already joins ``blocks`` → ``refs`` at query time for the
+        ``corpus_id`` is forwarded to the vector index for API parity
+        with legacy callers; the pgvector backend ignores it because
+        it already JOINs ``blocks`` → ``refs`` at query time for the
         corpus filter.
 
         Returns the number of blocks successfully indexed (0 on any failure).
@@ -934,10 +908,10 @@ class Store:
         Args:
             query: Natural-language query to embed and rank against.
             top_k: Max number of hits to return.
-            where: Chroma-style filter dict forwarded to the vector
-                index.  See :meth:`VectorIndex.search_text` for the
-                supported keys (``paper_id``, ``profile``,
-                ``block_type``, ``corpus_id``).  Scalar or
+            where: Filter dict forwarded to the vector index (keys:
+                ``paper_id``, ``profile``, ``block_type``,
+                ``corpus_id``; legacy Chroma-style dict naming kept
+                for API parity with pre-1.0 callers).  Scalar or
                 ``{'$in': [...]}``.
             corpora: Convenience kwarg for cross-corpus search —
                 pass a list of corpus ids (``['papers', 'memories',
@@ -1259,9 +1233,6 @@ class Store:
         :data:`SKIP_EMBED_TYPES`, and pushes freshly computed vectors
         into the pgvector column in batches.
 
-        Only supported against the ``postgres`` vector backend — the
-        Chroma backend has no concept of a NULL embedding row to find.
-
         Args:
             batch_size: Texts per call to the embedder.  Larger batches
                 amortise the model's per-call overhead but keep a bigger
@@ -1282,14 +1253,8 @@ class Store:
               * ``failed`` — blocks where the embedder raised
 
         Raises:
-            NotImplementedError: vector backend is not postgres.
             RuntimeError: pgvector column is not available.
         """
-        if self._config.vector_backend != "postgres":
-            raise NotImplementedError(
-                "backfill_embeddings() requires vector_backend='postgres' "
-                f"(current: {self._config.vector_backend!r})"
-            )
         if not hasattr(Block, "embedding"):
             raise RuntimeError(
                 "pgvector 'embedding' column is not present on blocks — "

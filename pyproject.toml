@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "acatome-store"
-version = "0.9.0"
-description = "Persistent storage, dedup, metadata queries, and semantic search for acatome bundles"
+version = "1.0.0"
+description = "Persistent storage, dedup, metadata queries, and semantic search for acatome bundles (Postgres + pgvector)"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.11"
 authors = [{ name = "Reto Stamm", email = "reto@retostamm.com" }]
-keywords = ["scientific-papers", "storage", "semantic-search", "citations", "sqlite", "postgres"]
+keywords = ["scientific-papers", "storage", "semantic-search", "citations", "postgres", "pgvector"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -21,9 +21,10 @@ classifiers = [
 dependencies = [
     "acatome-meta>=0.3.6",
     "sqlalchemy>=2.0",
-    "llama-index-core>=0.11",
-    "llama-index-vector-stores-chroma>=0.2",
-    "chromadb>=0.5",
+    # Postgres + pgvector are mandatory since v1.0.0 — no Chroma/SQLite
+    # fallback path any more, so these move out of the optional set.
+    "psycopg[binary]>=3.0",
+    "pgvector>=0.3",
     "precis-summary>=0.1.0",
     "typer>=0.12",
 ]
@@ -34,8 +35,6 @@ Repository = "https://github.com/retospect/acatome-store"
 
 [project.optional-dependencies]
 embeddings = ["sentence-transformers>=3.0"]
-postgres = ["psycopg[binary]>=3.0", "pgvector>=0.3"]
-mysql = ["pymysql>=1.0"]
 neo4j = ["neo4j>=5.0"]
 
 [project.scripts]

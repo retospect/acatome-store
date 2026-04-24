@@ -24,8 +24,8 @@ Deprecated (kept for migration compatibility):
   ``citations``   — Use ``links`` with relation='cites' instead.
   ``notes``       — Use refs in the 'notes' corpus with 'annotates' links.
 
-Portable across SQLite, Postgres, and MySQL via connection string.
-On Postgres, ``blocks.embedding`` uses pgvector for native ANN search.
+Postgres-only as of v1.0.0.  ``blocks.embedding`` is a pgvector
+column for native ANN search.
 """
 
 from __future__ import annotations
@@ -640,9 +640,9 @@ def create_blocks_view(engine) -> None:
 def add_pgvector_column(embed_dim: int = 384) -> None:
     """Add a pgvector ``embedding`` column to the Block model.
 
-    Call this BEFORE ``create_all()`` when the backend is Postgres
-    with pgvector. For SQLite/MySQL, this is a no-op (blocks store
-    text only; vectors live in Chroma via LlamaIndex).
+    Call this BEFORE ``create_all()`` so the table ships with the
+    vector column.  Safe to call multiple times — idempotent via the
+    ``"embedding" not in columns`` guard below.
     """
     from pgvector.sqlalchemy import Vector
     from sqlalchemy.orm import column_property

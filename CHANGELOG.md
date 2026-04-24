@@ -4,35 +4,72 @@ All notable changes to **acatome-store** will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.9.0] — unreleased
+## [1.0.0] — unreleased
+
+### Removed — BREAKING
+
+- **Chroma vector backend** is gone.  `ChromaIndex` is no longer
+  exported; `chromadb` and `llama-index-vector-stores-chroma` are
+  no longer dependencies.  The factory always returns a
+  `PgVectorIndex`.
+- **SQLite metadata backend** is gone.  `Store.__init__` raises
+  `RuntimeError` if `db_url` isn't a `postgresql+psycopg://…` URL.
+  The old SQLite-specific migration branch (`PRAGMA foreign_keys`,
+  `PRAGMA table_info`, `CREATE UNIQUE INDEX` workaround) has been
+  deleted.
+- **`StoreConfig(metadata_backend=..., vector_backend=..., graph_backend=...)`**
+  constructor args are gone (`TypeError` at construction).  They
+  remain exposed as read-only properties always returning
+  `"postgres"` / `"pgvector"` / `"none"` so downstream UI callers
+  (e.g. `acatome-chat stats`) keep working unchanged.
+
+### Migration (0.9 → 1.0)
+
+Existing SQLite+Chroma deployments need to move to Postgres with
+pgvector before upgrading.  One-liner to move your content:
+
+```
+# 1. Stand up Postgres with pgvector
+createdb acatome && psql -c 'CREATE EXTENSION vector' acatome
+
+# 2. Point acatome at it (in ~/.acatome/config.toml)
+[store]
+pg_host = "localhost"
+pg_user = "acatome"
+pg_password = "…"
+
+# 3. Re-ingest your bundles
+acatome-store reingest
+```
+
+The acatome-meta `[store] vector_backend = "chroma"` /
+`metadata_backend = "sqlite"` config keys are silently ignored by
+acatome-store 1.0 — acatome-meta still reads them for compatibility
+with older packages but the store only consults the `pg_*` fields.
 
 ### Added
 
 - **Cross-corpus filter on `search_text`.**  The vector index's
-  `search_text(where={...})` now accepts `corpus_id` as a filter
-  key, scalar (`corpus_id='memories'`) or list
-  (`{'$in': ['papers', 'websites']}`).  On pgvector the filter is
-  a JOIN to `refs.corpus_id` at query time.  On Chroma the filter
-  reads a `corpus_id` metadata field stamped at `add_blocks` time.
+  `search_text(where={...})` accepts `corpus_id` as a filter key,
+  scalar (`corpus_id='memories'`) or list
+  (`{'$in': ['papers', 'websites']}`).  Implemented as a JOIN to
+  `refs.corpus_id` at query time.
 - **`Store.search_text(corpora=[...])` convenience kwarg.**  Passes
   a list of corpus ids through as the corpus filter so cross-corpus
   callers (e.g. the new `search(type='all')` in precis-mcp) don't
   have to craft the where dict themselves.
-- **`corpus_id` always emitted in hit metadata.**  The pgvector
-  `search_text` now JOINs `blocks → refs` on every call and
-  surfaces `corpus_id`, `slug`, and `ref_title` in each hit's
-  metadata.  Removes the N+1 `Store.get(pid)` lookup that existing
-  callers used for enrichment.
-- **`ChromaIndex.add_blocks(..., corpus_id=...)`.**  Stamps the
-  corpus id onto each block's metadata dict so cross-corpus filters
-  work on the Chroma backend too.  `PgVectorIndex.add_blocks`
-  accepts the kwarg for API parity but ignores it (the corpus lives
-  on `refs` already).
+- **`corpus_id` always emitted in hit metadata.**  `search_text`
+  JOINs `blocks → refs` on every call and surfaces `corpus_id`,
+  `slug`, `ref_title`, and `ref_id` (int) in each hit's metadata.
+  Removes the N+1 `Store.get(pid)` lookup that callers used for
+  enrichment.
 - **`corpus_id` threaded through every ingest path.**  Paper bundle
-  ingest now passes `corpus_id='papers'` to `index.add_blocks`;
+  ingest passes `corpus_id='papers'` to `index.add_blocks`;
   direct-write corpora (todos, flashcards, memories, web, book,
   conversations) pass their own `corpus_id` automatically via
-  `_index_direct_blocks`.
+  `_index_direct_blocks`.  The kwarg is accepted by `PgVectorIndex`
+  for API parity with legacy callers but ignored (corpus already
+  lives on `refs`).
 
 ### Fixed
 
