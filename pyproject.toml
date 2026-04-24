@@ -47,6 +47,8 @@ dev = [
     "ruff>=0.11",
     "mypy>=1.15",
     "pre-commit>=4",
+    # Required by ingest path which re-embeds bundle blocks for vector indexing
+    "sentence-transformers>=3.0",
 ]
 
 [tool.hatch.build.targets.wheel]
