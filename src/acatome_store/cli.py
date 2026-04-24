@@ -217,6 +217,58 @@ def unretract(
     store.close()
 
 
+@app.command(name="backfill-embeddings")
+def backfill_embeddings(
+    corpus: str | None = typer.Option(
+        None,
+        "--corpus",
+        "-c",
+        help="Restrict to refs in this corpus (e.g. todos, flashcards).",
+    ),
+    batch_size: int = typer.Option(
+        64, "--batch-size", "-b", help="Texts embedded per batch."
+    ),
+    limit: int | None = typer.Option(
+        None, "--limit", "-n", help="Stop after this many blocks."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be embedded, without writing."
+    ),
+):
+    """Populate embeddings for blocks written before embed-on-write.
+
+    Direct-write corpora (todos, flashcards, wiki, notes, memories,
+    conversations) historically stored blocks without embeddings.  This
+    command finds rows with ``embedding IS NULL``, runs them through
+    the configured embedder in batches, and writes the vectors back.
+
+    Postgres backend only.  Safe to re-run — already-embedded rows are
+    skipped by the query filter.
+    """
+    from acatome_store.store import Store
+
+    store = Store()
+    try:
+        result = store.backfill_embeddings(
+            batch_size=batch_size,
+            corpus_id=corpus,
+            limit=limit,
+            dry_run=dry_run,
+        )
+    except (NotImplementedError, RuntimeError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        store.close()
+
+    typer.echo(
+        f"scanned={result['scanned']}  "
+        f"embedded={result['embedded']}  "
+        f"skipped={result['skipped']}  "
+        f"failed={result['failed']}"
+    )
+
+
 @app.command()
 def catalog(
     output: Path = typer.Option(

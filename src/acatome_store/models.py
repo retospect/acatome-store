@@ -191,6 +191,60 @@ CORPUS_SEEDS = [
         '["journal"]',
         "Conversation summaries and decisions",
     ),
+    (
+        "memories",
+        "Memory Drawers",
+        "memory",
+        "direct",
+        "memory:{title}",
+        '["memory"]',
+        (
+            "Verbatim memory drawers with tags — long-term agent "
+            "knowledge. Slug-based addressing; pgvector search; /recent "
+            "and /tags views."
+        ),
+    ),
+    (
+        "conversations",
+        "Conversation Transcripts",
+        "conversation",
+        "direct",
+        "conv:{session}",
+        '["conversation"]',
+        (
+            "Session-level conversation transcripts. Turn-per-block. "
+            "Id format: ISO date + short label, or uuid. /session/N view."
+        ),
+    ),
+    (
+        "websites",
+        "Website Bookmarks",
+        "web",
+        "direct",
+        "web:{host}-{slug}",
+        '["web"]',
+        (
+            "User-curated website bookmarks with summaries and tags.  "
+            "Slug derived from canonical URL; one ref per unique URL.  "
+            "Meta stores url, canonical_url, kind, wayback_url, "
+            "fetch status.  /recent, /tags, /kinds views."
+        ),
+    ),
+    (
+        "books",
+        "Book Notes",
+        "book",
+        "direct",
+        "book:{author}{year}{slug}",
+        '["book"]',
+        (
+            "User-curated book notes with author, ISBN, status, and "
+            "summary.  ISBN optional (pre-ISBN and obscure books are "
+            "first-class).  Large books ingested via paper: pipeline "
+            "and cross-linked via meta.paper_slug.  /to-read, "
+            "/reading, /read views."
+        ),
+    ),
 ]
 
 

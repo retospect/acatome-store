@@ -69,6 +69,226 @@ class TestIngest:
             assert ref.slug == "smith2024quantuma"
 
 
+class TestRefreshOnReingest:
+    """Re-ingest should repair stale garbage metadata when the new bundle is better."""
+
+    @staticmethod
+    def _write_bundle(tmp_path, name, header_overrides, blocks=None):
+        import gzip
+        import json
+
+        base_header = {
+            "paper_id": "",
+            "slug": "",
+            "title": "",
+            "authors": [],
+            "year": None,
+            "doi": None,
+            "arxiv_id": None,
+            "s2_id": None,
+            "journal": None,
+            "abstract": "",
+            "entry_type": "article",
+            "keywords": [],
+            "pdf_hash": "0" * 64,
+            "page_count": 1,
+            "source": "test",
+            "verified": False,
+            "verify_warnings": [],
+            "extracted_at": "2024-01-01T00:00:00+00:00",
+        }
+        base_header.update(header_overrides)
+        data = {
+            "header": base_header,
+            "blocks": blocks
+            or [
+                {
+                    "node_id": f"{base_header['slug']}-p00-000",
+                    "page": 0,
+                    "type": "text",
+                    "text": "body text",
+                    "section_path": [],
+                    "bbox": None,
+                    "embeddings": {},
+                    "summary": None,
+                }
+            ],
+            "enrichment_meta": None,
+        }
+        path = tmp_path / f"{name}.acatome"
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            json.dump(data, f)
+        return path
+
+    def test_garbage_title_replaced_by_clean_title(self, store, tmp_path):
+        """Bug: stale InDesign-filename title survives re-ingest of same PDF."""
+        garbage = self._write_bundle(
+            tmp_path,
+            "stale",
+            {
+                "slug": "simpson2007nmat",
+                "title": "nmat1849 Geim Progress Article.indd",
+                "authors": [],
+                "year": None,
+                "doi": None,
+                "pdf_hash": "d" * 64,
+                "verified": False,
+                "source": "embedded",
+            },
+        )
+        clean = self._write_bundle(
+            tmp_path,
+            "clean",
+            {
+                "slug": "geim2007rise",
+                "title": "The rise of graphene",
+                "authors": [{"name": "Geim, A. K."}, {"name": "Novoselov, K. S."}],
+                "year": 2007,
+                "doi": "10.1038/nmat1849",
+                "journal": "Nature Materials",
+                "pdf_hash": "d" * 64,  # same PDF
+                "verified": True,
+                "source": "crossref_filename",
+            },
+        )
+
+        ref_id_1 = store.ingest(garbage)
+        ref_id_2 = store.ingest(clean)
+        assert ref_id_1 == ref_id_2  # still deduped
+
+        with store._Session() as session:
+            ref = session.get(Ref, ref_id_2)
+            assert ref.title == "The rise of graphene"
+            assert ref.doi == "10.1038/nmat1849"
+            assert ref.year == 2007
+            assert ref.slug == "geim2007rise"
+            assert ref.paper.verified is True
+
+    def test_fill_blanks_on_verified_reingest(self, store, tmp_path):
+        """Original ingest with missing DOI/year; re-ingest with verified data fills them."""
+        sparse = self._write_bundle(
+            tmp_path,
+            "sparse",
+            {
+                "slug": "anon2024paper",
+                "title": "Some Title",
+                "pdf_hash": "e" * 64,
+                "verified": False,
+            },
+        )
+        full = self._write_bundle(
+            tmp_path,
+            "full",
+            {
+                "slug": "anon2024paper",
+                "title": "Some Title",
+                "authors": [{"name": "Doe, Jane"}],
+                "year": 2024,
+                "doi": "10.1234/fill-me-in",
+                "pdf_hash": "e" * 64,
+                "verified": True,
+            },
+        )
+
+        store.ingest(sparse)
+        ref_id = store.ingest(full)
+
+        with store._Session() as session:
+            ref = session.get(Ref, ref_id)
+            assert ref.doi == "10.1234/fill-me-in"
+            assert ref.year == 2024
+            assert ref.authors  # populated
+
+    def test_verified_metadata_not_overwritten_by_unverified(self, store, tmp_path):
+        """Safety: a verified Ref must NOT be clobbered by a later unverified bundle."""
+        verified = self._write_bundle(
+            tmp_path,
+            "verified",
+            {
+                "slug": "real2024paper",
+                "title": "Real Paper Title",
+                "authors": [{"name": "Real, Author"}],
+                "year": 2024,
+                "doi": "10.1234/real",
+                "pdf_hash": "a1" * 32,
+                "verified": True,
+            },
+        )
+        bad = self._write_bundle(
+            tmp_path,
+            "bad",
+            {
+                "slug": "junk",
+                "title": "some-pdf-filename.indd",
+                "year": 1999,
+                "doi": "10.9999/wrong",
+                "pdf_hash": "a1" * 32,  # same PDF
+                "verified": False,
+            },
+        )
+
+        ref_id = store.ingest(verified)
+        store.ingest(bad)
+
+        with store._Session() as session:
+            ref = session.get(Ref, ref_id)
+            # Clean title + verified DOI/year preserved
+            assert ref.title == "Real Paper Title"
+            assert ref.doi == "10.1234/real"
+            assert ref.year == 2024
+            assert ref.slug == "real2024paper"
+
+    def test_slug_upgrade_skipped_on_collision(self, store, tmp_path):
+        """Upgrade must not overwrite slug if the new slug collides with another Ref."""
+        # Seed another Ref with the target slug
+        other = self._write_bundle(
+            tmp_path,
+            "other",
+            {
+                "slug": "geim2007rise",
+                "title": "Something Else Entirely",
+                "doi": "10.1111/other",
+                "pdf_hash": "b2" * 32,
+                "verified": True,
+            },
+        )
+        garbage = self._write_bundle(
+            tmp_path,
+            "stale2",
+            {
+                "slug": "simpson2007nmat",
+                "title": "nmat1849 Geim Progress Article.indd",
+                "pdf_hash": "c3" * 32,
+                "verified": False,
+            },
+        )
+        clean = self._write_bundle(
+            tmp_path,
+            "clean2",
+            {
+                "slug": "geim2007rise",  # collides with 'other'
+                "title": "The rise of graphene",
+                "doi": "10.1038/nmat1849",
+                "year": 2007,
+                "pdf_hash": "c3" * 32,
+                "verified": True,
+            },
+        )
+
+        store.ingest(other)
+        stale_id = store.ingest(garbage)
+        store.ingest(clean)
+
+        with store._Session() as session:
+            ref = session.get(Ref, stale_id)
+            # Title/DOI/year upgraded…
+            assert ref.title == "The rise of graphene"
+            assert ref.doi == "10.1038/nmat1849"
+            assert ref.year == 2007
+            # …but slug preserved (would collide with 'other')
+            assert ref.slug == "simpson2007nmat"
+
+
 class TestReembed:
     """Test embedding model mismatch detection and re-embed on ingest."""
 

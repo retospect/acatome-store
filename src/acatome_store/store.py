@@ -27,11 +27,13 @@ from pathlib import Path
 from typing import Any
 
 from acatome_meta.literature import (
+    SKIP_EMBED_TYPES,
     EmbedderUnavailableError,
 )
 from acatome_meta.literature import (
     make_slug as _lit_make_slug,
 )
+from acatome_meta.pdf import is_garbage_title as _is_garbage_title
 from precis_summary import pick_best_summary
 from precis_summary.rake import telegram_precis
 from sqlalchemy import create_engine, select
@@ -73,6 +75,11 @@ from acatome_store.models import (
 from acatome_store.vector import VectorIndex, create_index
 
 log = logging.getLogger(__name__)
+
+# Sentinel for distinguishing "not yet computed" from a cached ``None``
+# in the lazy embedder property.  A plain ``None`` means "embedder is
+# unavailable, don't try again"; ``_MISSING`` means "haven't tried yet".
+_MISSING: Any = object()
 
 
 class Store:
@@ -152,14 +159,21 @@ class Store:
         # so we add a separate CREATE UNIQUE INDEX step below.
         migrations = [
             ("refs", "tags", "TEXT", "TEXT"),
-            ("refs", "corpus_id",
-             "VARCHAR DEFAULT 'papers' REFERENCES corpora(id)",
-             "VARCHAR DEFAULT 'papers'"),
+            (
+                "refs",
+                "corpus_id",
+                "VARCHAR DEFAULT 'papers' REFERENCES corpora(id)",
+                "VARCHAR DEFAULT 'papers'",
+            ),
             ("refs", "slug", "VARCHAR UNIQUE", "VARCHAR"),
             ("refs", "published_date", "DATE", "DATE"),
             ("refs", "metadata", "TEXT", "TEXT"),
-            ("corpora", "write_policy",
-             "VARCHAR DEFAULT 'ingestion'", "VARCHAR DEFAULT 'ingestion'"),
+            (
+                "corpora",
+                "write_policy",
+                "VARCHAR DEFAULT 'ingestion'",
+                "VARCHAR DEFAULT 'ingestion'",
+            ),
             ("notes", "origin", "VARCHAR", "VARCHAR"),
         ]
         # Validate identifiers once up-front so a typo in the migrations
@@ -192,10 +206,7 @@ class Store:
                     if not row:
                         col_type = pg_type if is_pg else sqlite_type
                         conn.execute(
-                            text(
-                                f"ALTER TABLE {table} "
-                                f"ADD COLUMN {column} {col_type}"
-                            )
+                            text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
                         )
                 # SQLite: add unique index for slug (replaces inline UNIQUE)
                 if not is_pg:
@@ -216,7 +227,7 @@ class Store:
             log.debug("Schema auto-migration skipped: %s", exc)
 
     def _ensure_embedding_column(self) -> None:
-        """Add embedding column to blocks table if missing (Postgres only)."""
+        """Add embedding column and HNSW index to blocks table if missing (Postgres only)."""
         try:
             from sqlalchemy import text
 
@@ -231,6 +242,27 @@ class Store:
                 if not row:
                     conn.execute(
                         text("ALTER TABLE blocks ADD COLUMN embedding vector(384)")
+                    )
+                # Ensure HNSW index exists for ANN search (without it,
+                # every vector query does a sequential scan).
+                hnsw = conn.execute(
+                    text(
+                        "SELECT 1 FROM pg_indexes "
+                        "WHERE tablename = 'blocks' "
+                        "AND indexdef LIKE '%hnsw%'"
+                    )
+                ).fetchone()
+                if not hnsw:
+                    log.info(
+                        "Creating HNSW index on blocks.embedding — "
+                        "this may take a few minutes on large tables"
+                    )
+                    conn.execute(
+                        text(
+                            "CREATE INDEX idx_blocks_embedding_hnsw "
+                            "ON blocks USING hnsw (embedding vector_cosine_ops) "
+                            "WITH (m = 16, ef_construction = 64)"
+                        )
                     )
                 conn.commit()
         except (OperationalError, ProgrammingError) as exc:
@@ -250,6 +282,117 @@ class Store:
             sf = self._Session if self._config.vector_backend == "postgres" else None
             self._index = create_index(self._config, session_factory=sf)
         return self._index
+
+    # ------------------------------------------------------------------
+    # Embedding helpers (for direct-write corpora)
+    # ------------------------------------------------------------------
+
+    @property
+    def _embedder(self):
+        """Lazy-init, cached embedding function.  ``None`` if unavailable.
+
+        Builds the embedder on first access from :attr:`_config`.  If the
+        embedding backend is missing (e.g. ``sentence-transformers`` not
+        installed in this venv) we log a single warning and cache ``None``
+        so subsequent direct-writes proceed without embeddings rather
+        than raising — writes succeeding with NULL embedding is exactly
+        the pre-existing behaviour.
+        """
+        cached = self.__dict__.get("_embedder_cache", _MISSING)
+        if cached is not _MISSING:
+            return cached
+        try:
+            fn = _get_embedder(self._config)
+        except EmbedderUnavailableError as exc:
+            log.warning(
+                "Embedder unavailable; direct-write blocks will not be "
+                "embedded automatically (use backfill_embeddings() later "
+                "after installing the provider): %s",
+                exc,
+            )
+            fn = None
+        self.__dict__["_embedder_cache"] = fn
+        return fn
+
+    def _compute_block_embeddings(
+        self,
+        block_specs: list[tuple[str, str, str]],
+    ) -> list[dict[str, Any]]:
+        """Embed a batch of direct-write blocks.
+
+        Args:
+            block_specs: list of ``(node_id, text, block_type)`` tuples.
+
+        Returns:
+            List of block dicts in the shape :meth:`VectorIndex.add_blocks`
+            consumes: ``{"node_id", "text", "type", "embeddings": {"default": [...]}}``.
+            Blocks whose ``block_type`` is in :data:`SKIP_EMBED_TYPES` or
+            whose text is empty are omitted from the result.  Returns an
+            empty list if the embedder is unavailable or raises.
+        """
+        embedder = self._embedder
+        if embedder is None or not block_specs:
+            return []
+
+        texts: list[str] = []
+        keep: list[tuple[str, str, str]] = []
+        for node_id, text, block_type in block_specs:
+            if block_type in SKIP_EMBED_TYPES:
+                continue
+            t = (text or "").strip()
+            if not t:
+                continue
+            texts.append(t)
+            keep.append((node_id, text, block_type))
+
+        if not texts:
+            return []
+
+        try:
+            embeddings = embedder(texts)
+        except Exception as exc:  # pragma: no cover — best-effort
+            log.warning(
+                "Embedding computation failed for %d direct-write block(s): %s",
+                len(texts),
+                exc,
+            )
+            return []
+
+        return [
+            {
+                "node_id": node_id,
+                "text": text,
+                "type": block_type,
+                "embeddings": {"default": emb},
+            }
+            for (node_id, text, block_type), emb in zip(keep, embeddings)
+        ]
+
+    def _index_direct_blocks(
+        self,
+        ref_id: int,
+        block_specs: list[tuple[str, str, str]],
+    ) -> int:
+        """Compute + push embeddings for direct-write blocks (best-effort).
+
+        Wraps :meth:`_compute_block_embeddings` + :meth:`VectorIndex.add_blocks`
+        in try/except so indexing failures never propagate out of a write.
+
+        Returns the number of blocks successfully indexed (0 on any failure).
+        """
+        embedded = self._compute_block_embeddings(block_specs)
+        if not embedded:
+            return 0
+        try:
+            return self.index.add_blocks(str(ref_id), embedded)
+        except Exception as exc:  # pragma: no cover — best-effort
+            log.warning(
+                "Failed to index %d direct-write embedding(s) for ref %s: %s",
+                len(embedded),
+                ref_id,
+                exc,
+            )
+            return 0
 
     # ------------------------------------------------------------------
     # Ref helpers
@@ -283,38 +426,106 @@ class Store:
 
         return None
 
+    @staticmethod
+    def _should_upgrade_ref(ref: Ref, header: dict) -> bool:
+        """Decide whether stale Ref fields should be overwritten by the new bundle.
+
+        Upgrade (replace non-null stale fields) is allowed when any of:
+        - No Paper yet (first-time ingest of content for this Ref)
+        - Existing Paper is ``verified=False`` and new bundle is ``verified=True``
+        - Current ``title`` looks like garbage (e.g. InDesign filename artefact)
+          while the new bundle provides a real title
+
+        Otherwise we preserve existing fields (fill-blanks-only policy).
+        """
+        new_verified = bool(header.get("verified"))
+        paper = ref.paper
+        if paper is None:
+            return True
+        if new_verified and not bool(paper.verified):
+            return True
+        new_title = header.get("title") or ""
+        cur_title = ref.title or ""
+        if (
+            cur_title
+            and _is_garbage_title(cur_title)
+            and new_title
+            and not _is_garbage_title(new_title)
+        ):
+            return True
+        return False
+
+    def _refresh_ref_metadata(self, ref: Ref, header: dict) -> None:
+        """Refresh Ref header-derived fields from a bundle header.
+
+        Policy:
+        - Always fill blanks (existing behavior)
+        - If :meth:`_should_upgrade_ref` returns True, additionally overwrite
+          stale non-null fields. This lets a later verified ingest repair a
+          Ref that was created earlier with garbage/unverified metadata.
+
+        Slug is NOT touched here — callers handle slug separately with
+        collision-aware logic.
+        """
+        upgrade = self._should_upgrade_ref(ref, header)
+
+        # Scalar columns: doi, s2_id, arxiv_id, title
+        for field in ("doi", "s2_id", "arxiv_id", "title"):
+            new_val = header.get(field)
+            if not new_val:
+                continue
+            cur_val = getattr(ref, field, None)
+            if not cur_val or upgrade:
+                setattr(ref, field, new_val)
+
+        # authors (stored as JSON array)
+        new_authors = header.get("authors")
+        if new_authors and (not ref.authors or upgrade):
+            ref.authors = json.dumps(new_authors)
+
+        # year
+        new_year = header.get("year")
+        if new_year and (not ref.year or upgrade):
+            ref.year = new_year
+
+        # keywords (stored as JSON array; fill-blanks only — user may curate)
+        if header.get("keywords") and not ref.keywords:
+            ref.keywords = json.dumps(header["keywords"])
+
+        # Metadata JSON: journal, entry_type, source
+        meta = ref._meta.copy() if ref.meta else {}
+        changed = False
+        for meta_field in ("journal", "entry_type", "source"):
+            val = header.get(meta_field)
+            if not val:
+                continue
+            if not meta.get(meta_field) or upgrade:
+                meta[meta_field] = val
+                changed = True
+        if changed or (meta and not ref.meta):
+            ref.meta = json.dumps(meta)
+
+        # Upgrade Paper verification flag when the new bundle confirms
+        if (
+            upgrade
+            and ref.paper is not None
+            and header.get("verified")
+            and not ref.paper.verified
+        ):
+            ref.paper.verified = True
+
     def _upsert_ref(self, session: Session, header: dict) -> Ref:
-        """Find or create a Ref from bundle header, updating sparse fields."""
+        """Find or create a Ref from bundle header, refreshing fields.
+
+        See :meth:`_refresh_ref_metadata` for the fill-blanks + upgrade policy.
+        Slug is NOT set here — ingest() handles it after collision check.
+        """
         ref = self._find_ref(session, header)
         if ref is None:
             ref = Ref()
             session.add(ref)
 
-        # Update direct columns (fill in blanks, never overwrite with None)
-        # Note: slug is NOT set here — ingest() handles it after collision check
-        for field in ("doi", "s2_id", "arxiv_id", "title"):
-            val = header.get(field)
-            if val and not getattr(ref, field, None):
-                setattr(ref, field, val)
-
-        if header.get("authors"):
-            if not ref.authors:
-                ref.authors = json.dumps(header["authors"])
-        if header.get("year") and not ref.year:
-            ref.year = header["year"]
-        if header.get("keywords"):
-            if not ref.keywords:
-                ref.keywords = json.dumps(header["keywords"])
-
-        # Metadata JSON: journal, entry_type, source, etc.
-        meta = ref._meta.copy() if ref.meta else {}
-        for meta_field in ("journal", "entry_type", "source"):
-            val = header.get(meta_field)
-            if val and not meta.get(meta_field):
-                meta[meta_field] = val
-        if (meta and not ref.meta) or meta:
-            ref.meta = json.dumps(meta)
-
+        self._refresh_ref_metadata(ref, header)
         session.flush()  # ensure ref.id is assigned
         return ref
 
@@ -380,11 +591,23 @@ class Store:
                 select(Paper).where(Paper.pdf_hash == pdf_hash)
             ).scalar_one_or_none()
             if existing:
-                if tags:
-                    ref = session.get(Ref, existing.ref_id)
-                    if ref:
+                ref = session.get(Ref, existing.ref_id)
+                if ref:
+                    # Refresh stale metadata (e.g. garbage title from an
+                    # earlier unverified ingest) from the fresh bundle header.
+                    upgrade = self._should_upgrade_ref(ref, header)
+                    self._refresh_ref_metadata(ref, header)
+                    # Upgrade slug when the new bundle is clearly better
+                    # (unverified→verified or garbage→clean title).
+                    if upgrade and slug and slug != ref.slug:
+                        collision = session.execute(
+                            select(Ref).where(Ref.slug == slug, Ref.id != ref.id)
+                        ).scalar_one_or_none()
+                        if not collision:
+                            ref.slug = slug
+                    if tags:
                         self._merge_tags(ref, tags)
-                        session.commit()
+                    session.commit()
                 return existing.ref_id
 
             # Find or create the Ref (identity)
@@ -608,23 +831,40 @@ class Store:
             if tags:
                 self._merge_tags(ref, tags)
 
-            # Insert blocks
+            # Insert blocks (embeddings are computed after commit below —
+            # we need ref.id + committed rows for index.add_blocks to find
+            # them, and we don't want embedding failures to roll back the
+            # ref/block inserts themselves).
+            block_specs: list[tuple[str, str, str]] = []
             for i, b in enumerate(blocks or []):
                 node_id = f"{slug}-b{i:04d}"
+                block_type = b.get("block_type", "text")
+                text = b.get("text", "")
                 block = Block(
                     node_id=node_id,
                     profile="default",
                     ref_id=ref.id,
                     page=0,
                     block_index=i,
-                    block_type=b.get("block_type", "text"),
-                    text=b.get("text", ""),
+                    block_type=block_type,
+                    text=text,
                     section_path=json.dumps(b.get("section_path", [])),
                 )
                 session.add(block)
+                block_specs.append((node_id, text, block_type))
 
             session.commit()
-            return ref.id
+            ref_id = ref.id
+
+        # Best-effort embedding pass — direct-write corpora (todos,
+        # flashcards, memories, notes, wiki, conversations) previously
+        # wrote blocks with NULL embedding and were invisible to
+        # semantic search.  We now populate them on write so they
+        # participate in cross-corpus search immediately.  Failures
+        # here are logged but do not propagate: the ref already exists.
+        if block_specs:
+            self._index_direct_blocks(ref_id, block_specs)
+        return ref_id
 
     def update_ref_metadata(
         self,
@@ -813,11 +1053,21 @@ class Store:
             text: New text content.
 
         Raises ValueError if ref or block not found.
+
+        The block's embedding is refreshed best-effort after the text
+        change so semantic search stays consistent with the new content.
+        Indexing failures are logged but never propagate.
         """
         paper = self.get(identifier)
-        if not paper or "ref_id" not in paper:
+        # ``Ref.to_dict()`` surfaces ``id`` for unpapered refs (todos,
+        # flashcards, wiki, notes, memories) and ``ref_id`` only when
+        # a :class:`Paper` ingestion receipt is merged in.  Accept
+        # either so direct-write corpora work here.
+        ref_id = paper.get("ref_id") if paper else None
+        if ref_id is None and paper:
+            ref_id = paper.get("id")
+        if ref_id is None:
             raise ValueError(f"Ref not found: {identifier}")
-        ref_id = paper["ref_id"]
         with self._Session() as session:
             block = session.execute(
                 select(Block).where(
@@ -828,7 +1078,254 @@ class Store:
             if not block:
                 raise ValueError(f"Block not found: {node_id} in ref {identifier}")
             block.text = text
+            block_type = block.block_type
             session.commit()
+
+        # Refresh embedding for the changed text.
+        self._index_direct_blocks(ref_id, [(node_id, text, block_type)])
+
+    def add_block(
+        self,
+        identifier,
+        *,
+        text: str,
+        block_type: str = "text",
+        node_id: str | None = None,
+        section_path: list | None = None,
+        page: int = 0,
+    ) -> str:
+        """Append a single block to an existing ref.
+
+        Public API for direct-write corpora (flashcards, todos, memories,
+        conversations, etc.) that need to add secondary blocks — context
+        notes on a flashcard, turn-by-turn appends to a conversation,
+        annotation blocks on a memory — without reaching into
+        :class:`~acatome_store.models.Block` or :attr:`_Session` directly.
+
+        The block's embedding is computed automatically (best-effort).
+
+        Args:
+            identifier: ref_id, slug, or DOI of the target ref.
+            text: Block text content.  Empty strings are permitted but
+                will not be embedded.
+            block_type: One of the seeded block types.  Defaults to
+                ``"text"``.  Types in :data:`SKIP_EMBED_TYPES` are
+                skipped by the embedder.
+            node_id: Optional explicit node_id.  When omitted, a
+                sequentially-numbered id is derived from the ref's slug
+                (``{slug}-b{NNNN}`` where NNNN is the next free index).
+            section_path: Optional list of section breadcrumb strings.
+            page: Page number if meaningful for this block_type; the
+                default of 0 is appropriate for synthetic/direct-write
+                blocks that have no source page.
+
+        Returns:
+            The block's ``node_id`` (generated or passed-in).
+
+        Raises:
+            ValueError: the ref does not exist, or the requested
+                ``node_id`` collides with an existing block.
+        """
+        ref = self.get(identifier)
+        # See :meth:`update_block_text` for the ``id``/``ref_id`` rationale.
+        ref_id = ref.get("ref_id") if ref else None
+        if ref_id is None and ref:
+            ref_id = ref.get("id")
+        if ref_id is None:
+            raise ValueError(f"Ref not found: {identifier}")
+        slug = ref.get("slug") or f"ref{ref_id}"
+
+        with self._Session() as session:
+            # Find the next free block_index for this ref.
+            existing = (
+                session.execute(
+                    select(Block)
+                    .where(Block.ref_id == ref_id)
+                    .order_by(Block.block_index.desc())
+                )
+                .scalars()
+                .all()
+            )
+            next_idx = 0
+            for b in existing:
+                if b.block_index is not None:
+                    next_idx = b.block_index + 1
+                    break
+            # Fallback: if no block has block_index set, use count.
+            if next_idx == 0 and existing:
+                next_idx = len(existing)
+
+            chosen_node_id = node_id or f"{slug}-b{next_idx:04d}"
+
+            # Collision check — node_id must be unique within the ref.
+            clash = session.execute(
+                select(Block).where(
+                    Block.ref_id == ref_id,
+                    Block.node_id == chosen_node_id,
+                )
+            ).scalar_one_or_none()
+            if clash:
+                raise ValueError(
+                    f"Block node_id already exists on ref {slug!r}: {chosen_node_id}"
+                )
+
+            block = Block(
+                node_id=chosen_node_id,
+                profile="default",
+                ref_id=ref_id,
+                page=page,
+                block_index=next_idx,
+                block_type=block_type,
+                text=text,
+                section_path=json.dumps(section_path or []),
+            )
+            session.add(block)
+            session.commit()
+
+        # Embed the new block (best-effort).
+        self._index_direct_blocks(ref_id, [(chosen_node_id, text, block_type)])
+        return chosen_node_id
+
+    # ------------------------------------------------------------------
+    # Embedding backfill (one-time migration for legacy direct-writes)
+    # ------------------------------------------------------------------
+
+    def backfill_embeddings(
+        self,
+        *,
+        batch_size: int = 64,
+        corpus_id: str | None = None,
+        limit: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, int]:
+        """Populate missing embeddings for blocks written before embed-on-write.
+
+        Direct-write corpora (todos, flashcards, notes, wiki, memories,
+        conversations) historically inserted blocks with ``embedding =
+        NULL`` because :meth:`create_ref` did not compute embeddings.
+        After upgrading to the embed-on-write code path, existing rows
+        remain unembedded; this method scans them, skips the usual
+        :data:`SKIP_EMBED_TYPES`, and pushes freshly computed vectors
+        into the pgvector column in batches.
+
+        Only supported against the ``postgres`` vector backend — the
+        Chroma backend has no concept of a NULL embedding row to find.
+
+        Args:
+            batch_size: Texts per call to the embedder.  Larger batches
+                amortise the model's per-call overhead but keep a bigger
+                peak memory footprint.
+            corpus_id: If set, restrict to refs in this corpus only.
+                Useful for staged rollouts (``corpus_id="todos"`` before
+                ``corpus_id="flashcards"`` etc.).
+            limit: If set, stop after scheduling this many blocks.  Use
+                to dry-run capacity planning.
+            dry_run: If True, log what *would* be embedded and return
+                counts without touching the embedder or the database.
+
+        Returns:
+            Dict with keys:
+              * ``scanned`` — blocks matching the NULL-embedding filter
+              * ``embedded`` — blocks that were successfully embedded
+              * ``skipped`` — blocks omitted (empty text / skip-type)
+              * ``failed`` — blocks where the embedder raised
+
+        Raises:
+            NotImplementedError: vector backend is not postgres.
+            RuntimeError: pgvector column is not available.
+        """
+        if self._config.vector_backend != "postgres":
+            raise NotImplementedError(
+                "backfill_embeddings() requires vector_backend='postgres' "
+                f"(current: {self._config.vector_backend!r})"
+            )
+        if not hasattr(Block, "embedding"):
+            raise RuntimeError(
+                "pgvector 'embedding' column is not present on blocks — "
+                "ensure the pgvector extension is installed and the store "
+                "was initialised with a postgres DSN."
+            )
+
+        scanned = embedded = skipped = failed = 0
+
+        with self._Session() as session:
+            stmt = (
+                select(Block).where(Block.embedding.is_(None)).where(Block.text != "")
+            )
+            if corpus_id:
+                stmt = stmt.join(Ref, Block.ref_id == Ref.id).where(
+                    Ref.corpus_id == corpus_id
+                )
+            if limit:
+                stmt = stmt.limit(limit)
+
+            blocks = session.execute(stmt).scalars().all()
+            scanned = len(blocks)
+
+            # Filter out skip-types client-side so the count reflects
+            # intent, not just SQL reach.
+            work: list[Block] = []
+            for b in blocks:
+                if b.block_type in SKIP_EMBED_TYPES:
+                    skipped += 1
+                    continue
+                if not (b.text or "").strip():
+                    skipped += 1
+                    continue
+                work.append(b)
+
+            if dry_run:
+                log.info(
+                    "backfill_embeddings dry-run: scanned=%d would_embed=%d skipped=%d",
+                    scanned,
+                    len(work),
+                    skipped,
+                )
+                return {
+                    "scanned": scanned,
+                    "embedded": 0,
+                    "skipped": skipped,
+                    "failed": 0,
+                }
+
+            embedder = self._embedder
+            if embedder is None:
+                raise EmbedderUnavailableError(
+                    "No embedder available for backfill — install the "
+                    "configured embed provider or adjust embed_model in "
+                    "the store config."
+                )
+
+            # Batch through the embedder, committing after each batch so
+            # partial progress survives a mid-run failure.
+            for i in range(0, len(work), batch_size):
+                batch = work[i : i + batch_size]
+                texts = [b.text for b in batch]
+                try:
+                    vectors = embedder(texts)
+                except Exception as exc:  # pragma: no cover — best-effort
+                    log.warning(
+                        "backfill batch failed at offset %d (%d blocks): %s",
+                        i,
+                        len(batch),
+                        exc,
+                    )
+                    failed += len(batch)
+                    continue
+
+                for b, vec in zip(batch, vectors):
+                    b.embedding = vec
+                    embedded += 1
+
+                session.commit()
+                log.info("backfill: %d/%d embedded", embedded, len(work))
+
+        return {
+            "scanned": scanned,
+            "embedded": embedded,
+            "skipped": skipped,
+            "failed": failed,
+        }
 
     # ------------------------------------------------------------------
     # Figures

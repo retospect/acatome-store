@@ -58,8 +58,7 @@ def assert_safe_ident(name: str, *, kind: str = "identifier") -> None:
     """
     if not isinstance(name, str) or not SAFE_IDENT_RE.match(name):
         raise ValueError(
-            f"Unsafe SQL {kind} {name!r}: "
-            "must match [A-Za-z_][A-Za-z0-9_]{0,62}"
+            f"Unsafe SQL {kind} {name!r}: must match [A-Za-z_][A-Za-z0-9_]{{0,62}}"
         )
 
 
@@ -168,5 +167,6 @@ def update_bundle_embeddings(
         log.warning(
             "Failed to write embeddings back to %s: %s. "
             "Check file permissions; next re-ingest will repeat the embedding work.",
-            bundle_path, exc,
+            bundle_path,
+            exc,
         )
