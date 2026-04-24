@@ -506,6 +506,111 @@ class TestGet:
         paper = store.get("10.1038/s41567-024-1234-5")
         assert paper is not None
 
+    def test_get_by_arxiv_id(self, store, tmp_path):
+        """get() must resolve by arxiv_id — without this, URIs like
+        ``arxiv:2207.09327`` are advertised by the precis-mcp PaperHandler
+        but the store can't find the ref.  Caught by precis-mcp's
+        ``TestExamplesResolveAgainstStore`` invariant test.
+        """
+        import gzip
+        import json
+
+        data = {
+            "header": {
+                "paper_id": "arxiv:2207.09327",
+                "slug": "schaeffer2022arxiv",
+                "title": "An ArXiv Paper",
+                "authors": [{"name": "Schaeffer, R."}],
+                "year": 2022,
+                "doi": None,
+                "arxiv_id": "2207.09327",
+                "s2_id": None,
+                "journal": None,
+                "abstract": "Abstract here...",
+                "entry_type": "article",
+                "keywords": [],
+                "pdf_hash": "c" * 64,
+                "page_count": 8,
+                "source": "arxiv",
+                "verified": True,
+                "verify_warnings": [],
+                "extracted_at": "2022-07-19T12:00:00+00:00",
+            },
+            "blocks": [
+                {
+                    "node_id": "arxiv:2207.09327-p00-000",
+                    "page": 0,
+                    "type": "text",
+                    "text": "Body text...",
+                    "section_path": ["1", "Intro"],
+                    "bbox": [72, 100, 540, 200],
+                    "embeddings": {},
+                    "summary": None,
+                }
+            ],
+            "enrichment_meta": None,
+        }
+        path = tmp_path / "schaeffer2022arxiv.acatome"
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            json.dump(data, f)
+        store.ingest(path)
+
+        # The bare arxiv id must resolve to the same ref as the slug.
+        by_arxiv = store.get("2207.09327")
+        by_slug = store.get("schaeffer2022arxiv")
+        assert by_arxiv is not None, "arxiv_id lookup returned None"
+        assert by_arxiv["slug"] == "schaeffer2022arxiv"
+        assert by_arxiv["ref_id"] == by_slug["ref_id"]
+
+    def test_get_by_s2_id(self, store, tmp_path):
+        """get() must resolve by s2_id — Semantic Scholar identifier."""
+        import gzip
+        import json
+
+        data = {
+            "header": {
+                "paper_id": "s2:abcdef1234567890",
+                "slug": "smith2023s2only",
+                "title": "S2 Only Paper",
+                "authors": [{"name": "Smith, J."}],
+                "year": 2023,
+                "doi": None,
+                "arxiv_id": None,
+                "s2_id": "abcdef1234567890",
+                "journal": None,
+                "abstract": "Abstract...",
+                "entry_type": "article",
+                "keywords": [],
+                "pdf_hash": "d" * 64,
+                "page_count": 5,
+                "source": "s2",
+                "verified": True,
+                "verify_warnings": [],
+                "extracted_at": "2023-01-15T12:00:00+00:00",
+            },
+            "blocks": [
+                {
+                    "node_id": "s2:abc-p00-000",
+                    "page": 0,
+                    "type": "text",
+                    "text": "Text",
+                    "section_path": ["1"],
+                    "bbox": [72, 100, 540, 200],
+                    "embeddings": {},
+                    "summary": None,
+                }
+            ],
+            "enrichment_meta": None,
+        }
+        path = tmp_path / "smith2023s2only.acatome"
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            json.dump(data, f)
+        store.ingest(path)
+
+        by_s2 = store.get("abcdef1234567890")
+        assert by_s2 is not None, "s2_id lookup returned None"
+        assert by_s2["slug"] == "smith2023s2only"
+
     def test_get_not_found(self, store):
         assert store.get("nonexistent") is None
 

@@ -990,9 +990,18 @@ class Store:
     # ------------------------------------------------------------------
 
     def get(self, identifier) -> dict[str, Any] | None:
-        """Get document by ref_id (int), slug, or DOI.
+        """Get document by ref_id (int), slug, DOI, arxiv_id, or s2_id.
 
         Returns merged ref + paper dict, or None.
+
+        The lookup tries each unique-key column in turn — slug first
+        (the canonical identifier), then the alternate identifier
+        columns.  This is what makes URIs like ``arxiv:2207.09327``
+        and ``doi:10.x/y`` actually resolve through the same code
+        path as ``paper:slug``.  Without arxiv_id and s2_id lookups
+        the schemes registered in precis-mcp (``arxiv:``, ``pmid:``,
+        etc.) advertise resolution they can't deliver — caught by the
+        precis-mcp ``TestExamplesResolveAgainstStore`` invariant.
         """
         with self._Session() as session:
             ref = None
@@ -1012,6 +1021,23 @@ class Store:
                 if not ref:
                     ref = session.execute(
                         select(Ref).where(Ref.doi == identifier)
+                    ).scalar_one_or_none()
+
+                # Try arxiv_id — resolves URIs like ``arxiv:2207.09327``
+                # that the precis-mcp PaperHandler routes through
+                # ``store.get(<bare-id>)`` after the URI parser
+                # strips the scheme.
+                if not ref:
+                    ref = session.execute(
+                        select(Ref).where(Ref.arxiv_id == identifier)
+                    ).scalar_one_or_none()
+
+                # Try s2_id — Semantic Scholar identifier, used by
+                # the citations subsystem.  Same fall-through reason
+                # as arxiv_id above.
+                if not ref:
+                    ref = session.execute(
+                        select(Ref).where(Ref.s2_id == identifier)
                     ).scalar_one_or_none()
 
                 # Try as int string
