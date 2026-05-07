@@ -49,6 +49,7 @@ class VectorIndex:
         query: str,
         top_k: int = 5,
         where: dict[str, Any] | None = None,
+        max_distance: float | None = None,
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
@@ -160,6 +161,7 @@ class PgVectorIndex(VectorIndex):
         query: str,
         top_k: int = 5,
         where: dict[str, Any] | None = None,
+        max_distance: float | None = None,
     ) -> list[dict[str, Any]]:
         """Search by text: embed query via sentence-transformers, then ANN.
 
@@ -179,6 +181,13 @@ class PgVectorIndex(VectorIndex):
         When ``where`` is omitted, the default filter
         ``Block.profile == 'default'`` is applied so we only search the
         default embedding profile.
+
+        ``max_distance`` (added for ``random:`` blast-radius support):
+        when set, only return hits whose cosine distance is ``≤
+        max_distance``.  Filters in SQL via the ``cosine_distance(emb)
+        <= max_distance`` predicate so the cap is applied before
+        ``LIMIT``.  ``None`` (default) preserves classical top-K
+        behaviour with no distance ceiling.
         """
         from sentence_transformers import SentenceTransformer
 
@@ -220,10 +229,15 @@ class PgVectorIndex(VectorIndex):
             # + ``slug`` + ``title``.  Cheap (Block.ref_id is indexed
             # via ``idx_blocks_ref_page`` + ``idx_refs_slug``) and
             # removes an N+1 lookup at the Store.search_text layer.
+            distance_expr = Block.embedding.cosine_distance(emb)
+            if max_distance is not None:
+                # Apply distance ceiling as part of the WHERE clause so
+                # the limit doesn't slice off close-but-trimmed hits.
+                filters.append(distance_expr <= float(max_distance))
             rows = (
                 session.query(
                     Block,
-                    Block.embedding.cosine_distance(emb).label("distance"),
+                    distance_expr.label("distance"),
                     Ref.corpus_id.label("corpus_id"),
                     Ref.slug.label("slug"),
                     Ref.title.label("ref_title"),

@@ -245,6 +245,26 @@ CORPUS_SEEDS = [
             "/reading, /read views."
         ),
     ),
+    (
+        "oracle",
+        "Oracle",
+        "oracle",
+        "direct",
+        "oracle:{tradition}",
+        '["oracle"]',
+        (
+            "Wisdom traditions — paper-shaped (one ref per tradition, "
+            "one chunk per entry).  Built-ins: oracle:iching (64 "
+            "hexagrams with three-layer rendering), oracle:chengyu, "
+            "oracle:proverbs-euro, oracle:proverbs-irish, oracle:stoic, "
+            "oracle:engineering, oracle:talmudic, oracle:zen.  Each "
+            "ref tagged ['built-in', 'oracle', '<tradition>'] so "
+            "tag-filtered queries (random, search) scope cleanly.  "
+            "User-written entries go to oracle:personal.  Sampled at "
+            "chunk level by random:."
+        ),
+        "chunk",
+    ),
 ]
 
 
@@ -260,16 +280,51 @@ class Corpus(Base):
     slug_pattern: Mapped[str | None] = mapped_column(String, nullable=True)
     default_tags: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON array
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ``sample_unit`` (v5.1+): hint to the ``random:`` kind about whether
+    # this corpus is most usefully sampled at the ``ref`` level (one
+    # whole document — papers, web bookmarks, books) or at the ``chunk``
+    # level (one block within a multi-entry ref — oracle traditions
+    # where each chunk is a self-contained entry).  Default ``ref``
+    # preserves existing behaviour for all corpora that don't explicitly
+    # opt into chunk sampling.
+    sample_unit: Mapped[str] = mapped_column(
+        String, nullable=False, default="ref"
+    )  # ref | chunk
 
 
 def seed_corpora(session: Session) -> None:
-    """Insert or update seed rows in corpora."""
-    for id_, label, handler, write_policy, pattern, tags, desc in CORPUS_SEEDS:
+    """Insert or update seed rows in corpora.
+
+    Tuple shape (with ``sample_unit`` optional, defaults to ``"ref"``)::
+
+        (id, label, handler, write_policy, slug_pattern, default_tags,
+         description[, sample_unit])
+    """
+    for row in CORPUS_SEEDS:
+        # 7-tuple = legacy shape, 8-tuple includes sample_unit.
+        if len(row) == 7:
+            id_, label, handler, write_policy, pattern, tags, desc = row
+            sample_unit = "ref"
+        elif len(row) == 8:
+            (id_, label, handler, write_policy, pattern, tags, desc,
+             sample_unit) = row
+        else:
+            raise ValueError(
+                f"CORPUS_SEEDS row has unexpected width {len(row)}: {row!r}"
+            )
         existing = session.get(Corpus, id_)
         if existing:
-            # Update write_policy for existing corpora (migration)
+            # Update write_policy for existing corpora (migration).
             if not existing.write_policy or existing.write_policy == "ingestion":
                 existing.write_policy = write_policy
+            # Forward-compat: backfill sample_unit on already-seeded rows.
+            if (
+                getattr(existing, "sample_unit", None) is None
+                or existing.sample_unit != sample_unit
+            ) and sample_unit != "ref":
+                # Only force-update when the seed declares a non-default
+                # sample_unit; otherwise leave operator overrides alone.
+                existing.sample_unit = sample_unit
         else:
             session.add(
                 Corpus(
@@ -280,6 +335,7 @@ def seed_corpora(session: Session) -> None:
                     slug_pattern=pattern,
                     default_tags=tags,
                     description=desc,
+                    sample_unit=sample_unit,
                 )
             )
     session.commit()

@@ -165,6 +165,12 @@ class Store:
             ("refs", "published_date", "DATE"),
             ("refs", "metadata", "TEXT"),
             ("corpora", "write_policy", "VARCHAR DEFAULT 'ingestion'"),
+            # ``sample_unit`` (precis-mcp v5.1+): hint to ``random:``
+            # about whether the corpus samples at ref or chunk
+            # granularity.  Default ``'ref'`` keeps existing corpora's
+            # behaviour unchanged; the oracle corpus seed (and any
+            # operator-set override) sets ``'chunk'``.
+            ("corpora", "sample_unit", "VARCHAR DEFAULT 'ref'"),
             ("notes", "origin", "VARCHAR"),
         ]
         # Validate identifiers once up-front so a typo in the migrations
@@ -1067,9 +1073,15 @@ class Store:
                         Use "*" for all blocks (main + supplements).
         """
         paper = self.get(identifier)
-        if not paper or "ref_id" not in paper:
+        # ``Ref.to_dict()`` surfaces ``id`` for unpapered refs (todos,
+        # flashcards, wiki, notes, memories, oracle) and ``ref_id``
+        # only when a :class:`Paper` ingestion receipt is merged in.
+        # Accept either so direct-write corpora work here.
+        ref_id = paper.get("ref_id") if paper else None
+        if ref_id is None and paper:
+            ref_id = paper.get("id")
+        if ref_id is None:
             return []
-        ref_id = paper["ref_id"]
         with self._Session() as session:
             stmt = select(Block).where(Block.ref_id == ref_id)
             if block_type:
@@ -1479,9 +1491,13 @@ class Store:
         summary (if available, else truncated text), section_path.
         """
         paper = self.get(identifier)
-        if not paper or "ref_id" not in paper:
+        # Same dual-key handling as :meth:`get_blocks` — direct-write
+        # corpora carry ``id`` not ``ref_id``.
+        ref_id = paper.get("ref_id") if paper else None
+        if ref_id is None and paper:
+            ref_id = paper.get("id")
+        if ref_id is None:
             return []
-        ref_id = paper["ref_id"]
         with self._Session() as session:
             stmt = (
                 select(Block)
@@ -1526,9 +1542,13 @@ class Store:
         count = 0
         with self._Session() as session:
             for paper in papers:
-                if not paper or "ref_id" not in paper:
+                # Same dual-key handling as :meth:`get_blocks` —
+                # direct-write corpora carry ``id`` not ``ref_id``.
+                ref_id = paper.get("ref_id") if paper else None
+                if ref_id is None and paper:
+                    ref_id = paper.get("id")
+                if ref_id is None:
                     continue
-                ref_id = paper["ref_id"]
                 rows = (
                     session.execute(
                         select(Block)
